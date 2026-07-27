@@ -1,0 +1,118 @@
+package domain
+
+import (
+	"encoding/json"
+	"errors"
+	"time"
+)
+
+type TaskStatus string
+
+const (
+	TaskStatusQueued    TaskStatus = "queued"
+	TaskStatusRunning   TaskStatus = "running"
+	TaskStatusSucceeded TaskStatus = "succeeded"
+	TaskStatusPartial   TaskStatus = "partially_succeeded"
+	TaskStatusFailed    TaskStatus = "failed"
+	TaskStatusCanceled  TaskStatus = "canceled"
+	TaskStatusRetrying  TaskStatus = "retrying"
+)
+
+var terminalStatuses = map[TaskStatus]bool{
+	TaskStatusSucceeded: true,
+	TaskStatusPartial:   true,
+	TaskStatusFailed:    true,
+	TaskStatusCanceled:  true,
+}
+
+type Task struct {
+	ID             string          `json:"id"`
+	Workflow       string          `json:"workflow"`
+	Status         TaskStatus      `json:"status"`
+	Input          json.RawMessage `json:"input"`
+	Result         json.RawMessage `json:"result,omitempty"`
+	ErrorMessage   string          `json:"error_message,omitempty"`
+	Progress       int             `json:"progress"`
+	RetryCount     int             `json:"retry_count"`
+	MaxRetries     int             `json:"max_retries"`
+	Version        uint64          `json:"version"`
+	LeaseOwner     string          `json:"lease_owner,omitempty"`
+	LeaseExpiresAt *time.Time      `json:"lease_expires_at,omitempty"`
+	CreatedAt      time.Time       `json:"created_at"`
+	UpdatedAt      time.Time       `json:"updated_at"`
+	StartedAt      *time.Time      `json:"started_at,omitempty"`
+	FinishedAt     *time.Time      `json:"finished_at,omitempty"`
+}
+
+func NewTask(id, workflow string, input json.RawMessage, maxRetries int, now time.Time) (*Task, error) {
+	if id == "" {
+		return nil, errors.New("task id is required")
+	}
+	if workflow == "" {
+		return nil, errors.New("workflow is required")
+	}
+	if len(input) == 0 {
+		input = json.RawMessage("{}")
+	}
+	if maxRetries < 0 {
+		return nil, errors.New("max retries cannot be negative")
+	}
+
+	return &Task{
+		ID:         id,
+		Workflow:   workflow,
+		Status:     TaskStatusQueued,
+		Input:      input,
+		Progress:   0,
+		MaxRetries: maxRetries,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}, nil
+}
+
+func (t *Task) MoveTo(next TaskStatus, now time.Time) error {
+	if t == nil {
+		return errors.New("task is nil")
+	}
+	if !CanTransition(t.Status, next) {
+		return errors.New("invalid task status transition")
+	}
+
+	t.Status = next
+	t.UpdatedAt = now
+
+	switch next {
+	case TaskStatusRunning:
+		if t.StartedAt == nil {
+			t.StartedAt = &now
+		}
+	case TaskStatusSucceeded, TaskStatusPartial, TaskStatusFailed, TaskStatusCanceled:
+		t.FinishedAt = &now
+		t.LeaseOwner = ""
+		t.LeaseExpiresAt = nil
+	}
+
+	return nil
+}
+
+func (t *Task) IsTerminal() bool {
+	if t == nil {
+		return false
+	}
+	return terminalStatuses[t.Status]
+}
+
+func CanTransition(from, to TaskStatus) bool {
+	switch from {
+	case TaskStatusQueued:
+		return to == TaskStatusRunning || to == TaskStatusCanceled
+	case TaskStatusRunning:
+		return to == TaskStatusSucceeded || to == TaskStatusPartial || to == TaskStatusFailed || to == TaskStatusCanceled || to == TaskStatusRetrying
+	case TaskStatusRetrying:
+		return to == TaskStatusRunning || to == TaskStatusFailed || to == TaskStatusCanceled
+	case TaskStatusSucceeded, TaskStatusPartial, TaskStatusFailed, TaskStatusCanceled:
+		return false
+	default:
+		return false
+	}
+}
