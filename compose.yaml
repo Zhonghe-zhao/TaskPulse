@@ -1,0 +1,29 @@
+name: taskpulse
+
+services:
+  mysql:
+    image: mysql:8.4.10
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-taskpulse}
+      MYSQL_USER: ${MYSQL_USER:-taskpulse}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-taskpulse_dev}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-taskpulse_root_dev}
+      TZ: UTC
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --default-time-zone=+00:00
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./migrations/000001_init.up.sql:/docker-entrypoint-initdb.d/000001_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+
+volumes:
+  mysql_data:

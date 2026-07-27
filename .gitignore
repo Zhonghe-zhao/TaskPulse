@@ -1,0 +1,24 @@
+# Binaries
+bin/
+*.exe
+*.test
+
+# Go build/test artifacts
+coverage.out
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Editor files
+.idea/
+.vscode/
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Runtime data
+tmp/
+logs/

@@ -1,0 +1,44 @@
+CREATE TABLE tasks (
+    id               VARCHAR(64)  NOT NULL,
+    workflow         VARCHAR(64)  NOT NULL,
+    status           VARCHAR(32)  NOT NULL,
+    input_json       JSON         NOT NULL,
+    result_json      JSON         NULL,
+    error_message    TEXT         NULL,
+    progress         TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    retry_count      INT UNSIGNED NOT NULL DEFAULT 0,
+    max_retries      INT UNSIGNED NOT NULL DEFAULT 0,
+    available_at     DATETIME(6)  NOT NULL,
+    lease_owner      VARCHAR(128) NULL,
+    lease_expires_at DATETIME(6)  NULL,
+    idempotency_key  VARCHAR(128) NULL,
+    version          BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    created_at       DATETIME(6)  NOT NULL,
+    updated_at       DATETIME(6)  NOT NULL,
+    started_at       DATETIME(6)  NULL,
+    finished_at      DATETIME(6)  NULL,
+
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_tasks_idempotency_key (idempotency_key),
+    KEY idx_tasks_claim (status, available_at, created_at, id),
+    KEY idx_tasks_expired_lease (status, lease_expires_at),
+    CONSTRAINT chk_tasks_progress CHECK (progress <= 100),
+    CONSTRAINT chk_tasks_retry_count CHECK (retry_count <= max_retries)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE task_events (
+    id           VARCHAR(64) NOT NULL,
+    task_id      VARCHAR(64) NOT NULL,
+    type         VARCHAR(64) NOT NULL,
+    message      TEXT        NOT NULL,
+    payload_json JSON        NULL,
+    progress     TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    created_at   DATETIME(6) NOT NULL,
+
+    PRIMARY KEY (id),
+    KEY idx_task_events_task_time (task_id, created_at, id),
+    CONSTRAINT fk_task_events_task
+        FOREIGN KEY (task_id) REFERENCES tasks(id)
+        ON DELETE CASCADE,
+    CONSTRAINT chk_task_events_progress CHECK (progress <= 100)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
