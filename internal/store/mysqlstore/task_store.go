@@ -1,0 +1,539 @@
+package mysqlstore
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	mysqldriver "github.com/go-sql-driver/mysql"
+	"github.com/zhaozhonghe/taskpulse/internal/domain"
+	storeerrors "github.com/zhaozhonghe/taskpulse/internal/store"
+)
+
+const insertTaskQuery = `
+INSERT INTO tasks (
+    id,
+    workflow,
+    status,
+    input_json,
+    result_json,
+    error_message,
+    progress,
+    retry_count,
+    max_retries,
+    available_at,
+    created_at,
+    updated_at,
+    started_at,
+    finished_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+const getTaskQuery = `
+SELECT
+    id,
+    workflow,
+    status,
+    input_json,
+    result_json,
+    error_message,
+    progress,
+    retry_count,
+    max_retries,
+    lease_owner,
+    lease_expires_at,
+    version,
+    created_at,
+    updated_at,
+    started_at,
+    finished_at
+FROM tasks
+WHERE id = ?`
+
+const claimNextTaskQuery = `
+SELECT
+    id,
+    workflow,
+    status,
+    input_json,
+    result_json,
+    error_message,
+    progress,
+    retry_count,
+    max_retries,
+    lease_owner,
+    lease_expires_at,
+    version,
+    created_at,
+    updated_at,
+    started_at,
+    finished_at
+FROM tasks
+WHERE status = ?
+  AND available_at <= ?
+ORDER BY available_at, created_at, id
+LIMIT 1
+FOR UPDATE SKIP LOCKED` //它解决多个 Worker 并发领取的问题。
+
+const claimExpiredTaskQuery = `
+SELECT
+    id,
+    workflow,
+    status,
+    input_json,
+    result_json,
+    error_message,
+    progress,
+    retry_count,
+    max_retries,
+    lease_owner,
+    lease_expires_at,
+    version,
+    created_at,
+    updated_at,
+    started_at,
+    finished_at
+FROM tasks
+WHERE status = ?
+  AND lease_expires_at <= ?
+  AND retry_count < max_retries
+ORDER BY lease_expires_at, created_at, id
+LIMIT 1
+FOR UPDATE SKIP LOCKED`
+
+const updateTaskQuery = `
+UPDATE tasks
+SET
+    status = ?,
+    result_json = ?,
+    error_message = ?,
+    progress = ?,
+    retry_count = ?,
+    max_retries = ?,
+    lease_owner = ?,
+    lease_expires_at = ?,
+    updated_at = ?,
+    started_at = ?,
+    finished_at = ?,
+    version = version + 1
+WHERE id = ?
+  AND version = ?`
+
+const renewLeaseQuery = `
+UPDATE tasks
+SET
+    lease_expires_at = ?,
+    updated_at = ?
+WHERE id = ?
+  AND status = ?
+  AND lease_owner = ?
+  AND lease_expires_at > ?`
+
+const selectExpiredExhaustedTaskQuery = `
+SELECT
+    id,
+    workflow,
+    status,
+    input_json,
+    result_json,
+    error_message,
+    progress,
+    retry_count,
+    max_retries,
+    lease_owner,
+    lease_expires_at,
+    version,
+    created_at,
+    updated_at,
+    started_at,
+    finished_at
+FROM tasks
+WHERE status = ?
+  AND lease_expires_at <= ?
+  AND retry_count >= max_retries
+ORDER BY lease_expires_at, created_at, id
+LIMIT 1
+FOR UPDATE SKIP LOCKED`
+
+type MySQLTaskStore struct {
+	db *sql.DB
+}
+
+var _ storeerrors.TaskStore = (*MySQLTaskStore)(nil)
+
+func NewTaskStore(db *sql.DB) (*MySQLTaskStore, error) {
+	if db == nil {
+		return nil, errors.New("mysql task store database is nil")
+	}
+	return &MySQLTaskStore{db: db}, nil
+}
+
+func (s *MySQLTaskStore) Create(ctx context.Context, task *domain.Task) error {
+	if task == nil {
+		return storeerrors.ErrNilTask
+	}
+
+	_, err := s.db.ExecContext(
+		ctx,
+		insertTaskQuery,
+		task.ID,
+		task.Workflow,
+		string(task.Status),
+		[]byte(task.Input),
+		nullableJSON(task.Result),
+		nullableString(task.ErrorMessage),
+		task.Progress,
+		task.RetryCount,
+		task.MaxRetries,
+		task.CreatedAt.UTC(),
+		task.CreatedAt.UTC(),
+		task.UpdatedAt.UTC(),
+		nullableTime(task.StartedAt),
+		nullableTime(task.FinishedAt),
+	)
+	if err != nil {
+		var mysqlError *mysqldriver.MySQLError
+		if errors.As(err, &mysqlError) && mysqlError.Number == 1062 {
+			return storeerrors.ErrTaskAlreadyExists
+		}
+		return fmt.Errorf("insert task %q: %w", task.ID, err)
+	}
+	return nil
+}
+
+func (s *MySQLTaskStore) Get(ctx context.Context, id string) (*domain.Task, error) {
+	task, err := scanTask(s.db.QueryRowContext(ctx, getTaskQuery, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, storeerrors.ErrTaskNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("select task %q: %w", id, err)
+	}
+	return task, nil
+}
+
+func (s *MySQLTaskStore) ClaimNext(ctx context.Context, options storeerrors.ClaimOptions) (_ *domain.Task, err error) {
+	if err := options.Validate(); err != nil {
+		return nil, err
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return nil, fmt.Errorf("begin claim task transaction: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	now := options.Now.UTC() //统一时间
+	//优先查询过期任务
+	task, err := scanTask(tx.QueryRowContext(
+		ctx,
+		claimExpiredTaskQuery,
+		string(domain.TaskStatusRunning),
+		now,
+	))
+	recovering := err == nil           //当前领取到的任务，不是普通 queued 任务，而是一个租约过期的 running 任务。
+	if errors.Is(err, sql.ErrNoRows) { //如果没有过期任务则查询queue任务
+		task, err = scanTask(tx.QueryRowContext(
+			ctx,
+			claimNextTaskQuery,
+			string(domain.TaskStatusQueued),
+			now,
+		))
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, storeerrors.ErrNoTaskAvailable
+	}
+	if err != nil {
+		return nil, fmt.Errorf("select next task for claim: %w", err)
+	}
+	if recovering {
+		task.RetryCount++
+		task.UpdatedAt = now
+	} else if err = task.MoveTo(domain.TaskStatusRunning, now); err != nil {
+		return nil, fmt.Errorf("move claimed task %q to running: %w", task.ID, err)
+	}
+	leaseExpiresAt := now.Add(options.LeaseDuration)
+	task.LeaseOwner = options.WorkerID
+	task.LeaseExpiresAt = &leaseExpiresAt
+
+	result, err := tx.ExecContext(
+		ctx,
+		`UPDATE tasks
+		 SET status = ?, retry_count = ?, updated_at = ?, started_at = ?,
+		     lease_owner = ?, lease_expires_at = ?, version = version + 1
+		 WHERE id = ? AND version = ?`,
+		string(task.Status),
+		task.RetryCount,
+		task.UpdatedAt,
+		nullableTime(task.StartedAt),
+		task.LeaseOwner,
+		nullableTime(task.LeaseExpiresAt),
+		task.ID,
+		task.Version,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("mark claimed task %q as running: %w", task.ID, err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("read claimed row count for task %q: %w", task.ID, err)
+	}
+	if rowsAffected != 1 {
+		return nil, fmt.Errorf(
+			"claim task %q at version %d affected %d rows",
+			task.ID,
+			task.Version,
+			rowsAffected,
+		)
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit claimed task %q: %w", task.ID, err)
+	}
+
+	task.Version++
+	return task, nil
+}
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanTask(row rowScanner) (*domain.Task, error) {
+	var task domain.Task
+	var status string
+	var inputJSON []byte
+	var resultJSON []byte
+	var errorMessage sql.NullString
+	var leaseOwner sql.NullString
+	var leaseExpiresAt sql.NullTime
+	var startedAt sql.NullTime
+	var finishedAt sql.NullTime
+
+	err := row.Scan(
+		&task.ID,
+		&task.Workflow,
+		&status,
+		&inputJSON,
+		&resultJSON,
+		&errorMessage,
+		&task.Progress,
+		&task.RetryCount,
+		&task.MaxRetries,
+		&leaseOwner,
+		&leaseExpiresAt,
+		&task.Version,
+		&task.CreatedAt,
+		&task.UpdatedAt,
+		&startedAt,
+		&finishedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	task.Status = domain.TaskStatus(status)
+	task.Input = cloneJSON(inputJSON)
+	task.Result = cloneJSON(resultJSON)
+	if errorMessage.Valid {
+		task.ErrorMessage = errorMessage.String
+	}
+	if leaseOwner.Valid {
+		task.LeaseOwner = leaseOwner.String
+	}
+	task.LeaseExpiresAt = timePointer(leaseExpiresAt)
+	task.CreatedAt = task.CreatedAt.UTC()
+	task.UpdatedAt = task.UpdatedAt.UTC()
+	task.StartedAt = timePointer(startedAt)
+	task.FinishedAt = timePointer(finishedAt)
+	return &task, nil
+}
+
+func (s *MySQLTaskStore) Update(ctx context.Context, task *domain.Task) error {
+	if task == nil {
+		return storeerrors.ErrNilTask
+	}
+
+	result, err := s.db.ExecContext(
+		ctx,
+		updateTaskQuery,
+		string(task.Status),
+		nullableJSON(task.Result),
+		nullableString(task.ErrorMessage),
+		task.Progress,
+		task.RetryCount,
+		task.MaxRetries,
+		nullableString(task.LeaseOwner),
+		nullableTime(task.LeaseExpiresAt),
+		task.UpdatedAt.UTC(),
+		nullableTime(task.StartedAt),
+		nullableTime(task.FinishedAt),
+		task.ID,
+		task.Version,
+	)
+	if err != nil {
+		return fmt.Errorf("update task %q at version %d: %w", task.ID, task.Version, err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read updated row count for task %q: %w", task.ID, err)
+	}
+	if rowsAffected == 1 {
+		return nil
+	}
+	if rowsAffected > 1 {
+		return fmt.Errorf("update task %q affected %d rows", task.ID, rowsAffected)
+	}
+
+	var exists int
+	err = s.db.QueryRowContext(ctx, "SELECT 1 FROM tasks WHERE id = ?", task.ID).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return storeerrors.ErrTaskNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("check task %q after versioned update: %w", task.ID, err)
+	}
+	return storeerrors.ErrTaskConflict
+}
+
+func (s *MySQLTaskStore) RenewLease(ctx context.Context, options storeerrors.RenewLeaseOptions) error {
+	if err := options.Validate(); err != nil {
+		return err
+	}
+
+	now := options.Now.UTC()
+	leaseExpiresAt := now.Add(options.LeaseDuration)
+	result, err := s.db.ExecContext(
+		ctx,
+		renewLeaseQuery,
+		leaseExpiresAt,
+		now,
+		options.TaskID,
+		string(domain.TaskStatusRunning),
+		options.WorkerID,
+		now,
+	)
+	if err != nil {
+		return fmt.Errorf("renew lease for task %q: %w", options.TaskID, err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read renewed lease row count for task %q: %w", options.TaskID, err)
+	}
+	if rowsAffected != 1 {
+		return storeerrors.ErrLeaseLost
+	}
+	return nil
+}
+
+// 找出下一条需要清理的过期任务，并将它标记为失败。
+func (s *MySQLTaskStore) FailNextExpired(ctx context.Context, now time.Time) (_ *domain.Task, err error) {
+	if now.IsZero() {
+		return nil, storeerrors.ErrInvalidCleanupTime
+	}
+	now = now.UTC()
+
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return nil, fmt.Errorf("begin expired task cleanup transaction: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	task, err := scanTask(tx.QueryRowContext(
+		ctx,
+		selectExpiredExhaustedTaskQuery,
+		string(domain.TaskStatusRunning),
+		now,
+	))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, storeerrors.ErrNoExpiredTask
+	}
+	if err != nil {
+		return nil, fmt.Errorf("select expired exhausted task: %w", err)
+	}
+
+	task.ErrorMessage = "task lease expired and retry budget exhausted"
+	if err = task.MoveTo(domain.TaskStatusFailed, now); err != nil {
+		return nil, fmt.Errorf("fail expired task %q: %w", task.ID, err)
+	}
+
+	result, err := tx.ExecContext(
+		ctx,
+		`UPDATE tasks
+		 SET status = ?, error_message = ?, updated_at = ?, finished_at = ?,
+		     lease_owner = NULL, lease_expires_at = NULL, version = version + 1
+		 WHERE id = ? AND version = ?`,
+		string(task.Status),
+		task.ErrorMessage,
+		task.UpdatedAt,
+		nullableTime(task.FinishedAt),
+		task.ID,
+		task.Version,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("persist expired task %q failure: %w", task.ID, err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("read expired task %q cleanup row count: %w", task.ID, err)
+	}
+	if rowsAffected != 1 {
+		return nil, fmt.Errorf(
+			"cleanup expired task %q at version %d affected %d rows",
+			task.ID,
+			task.Version,
+			rowsAffected,
+		)
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit expired task %q cleanup: %w", task.ID, err)
+	}
+
+	task.Version++
+	return task, nil
+}
+
+func nullableJSON(value json.RawMessage) any {
+	if len(value) == 0 {
+		return nil
+	}
+	return []byte(value)
+}
+
+func nullableString(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
+}
+
+func nullableTime(value *time.Time) any {
+	if value == nil {
+		return nil
+	}
+	return value.UTC()
+}
+
+func timePointer(value sql.NullTime) *time.Time {
+	if !value.Valid {
+		return nil
+	}
+	result := value.Time.UTC()
+	return &result
+}
+
+func cloneJSON(value []byte) json.RawMessage {
+	if value == nil {
+		return nil
+	}
+	return append(json.RawMessage(nil), value...)
+}
