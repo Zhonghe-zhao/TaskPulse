@@ -22,7 +22,8 @@ func main() {
 
 	taskStore := store.NewMemoryTaskStore()
 	eventStore := store.NewMemoryEventStore()
-	taskService := application.NewTaskService(taskStore, eventStore)
+	taskCreationStore := store.NewMemoryTaskCreationStore(taskStore, eventStore)
+	taskService := application.NewTaskService(taskStore, eventStore, taskCreationStore)
 	router := httptransport.NewRouter(httptransport.NewHandler(taskService))
 
 	urlCheckExecutor := urlcheck.NewWithConcurrency(

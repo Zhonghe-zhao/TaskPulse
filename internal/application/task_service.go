@@ -23,16 +23,22 @@ type CreateTaskInput struct {
 }
 
 type TaskService struct {
-	taskStore  store.TaskStore
-	eventStore store.EventStore
-	now        func() time.Time
+	taskStore         store.TaskStore
+	eventStore        store.EventStore
+	taskCreationStore store.TaskCreationStore
+	now               func() time.Time
 }
 
-func NewTaskService(taskStore store.TaskStore, eventStore store.EventStore) *TaskService {
+func NewTaskService(
+	taskStore store.TaskStore,
+	eventStore store.EventStore,
+	taskCreationStore store.TaskCreationStore,
+) *TaskService {
 	return &TaskService{
-		taskStore:  taskStore,
-		eventStore: eventStore,
-		now:        time.Now,
+		taskStore:         taskStore,
+		eventStore:        eventStore,
+		taskCreationStore: taskCreationStore,
+		now:               time.Now,
 	}
 }
 
@@ -53,10 +59,6 @@ func (s *TaskService) CreateTask(ctx context.Context, input CreateTaskInput) (*d
 		return nil, err
 	}
 
-	if err := s.taskStore.Create(ctx, task); err != nil {
-		return nil, err
-	}
-
 	event, err := domain.NewTaskEvent(
 		eventID,
 		task.ID,
@@ -70,7 +72,7 @@ func (s *TaskService) CreateTask(ctx context.Context, input CreateTaskInput) (*d
 		return nil, err
 	}
 
-	if err := s.eventStore.Append(ctx, event); err != nil {
+	if err := s.taskCreationStore.CreateTaskWithEvent(ctx, task, event); err != nil {
 		return nil, err
 	}
 

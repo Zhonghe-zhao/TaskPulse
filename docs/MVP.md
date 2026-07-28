@@ -34,8 +34,8 @@
 - [ ] 在 Compose MySQL 上运行并通过连接集成测试
 - [x] 实现 MySQLTaskStore.Create/Get/Update
 - [x] 实现 MySQLTaskStore.ClaimNext
-- [ ] 实现 MySQLEventStore
-- [ ] 在同一事务中创建 Task 和 Created Event
+- [x] 实现 MySQLEventStore.Append/ListByTaskID
+- [x] 在同一事务中创建 Task 和 Created Event
 - [ ] 使用唯一 `idempotency_key` 防止重复创建
 - [x] 使用 `FOR UPDATE SKIP LOCKED` 领取任务
 - [ ] 增加数据库集成测试

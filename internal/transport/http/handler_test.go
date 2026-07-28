@@ -69,6 +69,9 @@ func TestGetTaskReturnsNotFound(t *testing.T) {
 }
 
 func newTestRouter() http.Handler {
-	service := application.NewTaskService(store.NewMemoryTaskStore(), store.NewMemoryEventStore())
+	taskStore := store.NewMemoryTaskStore()
+	eventStore := store.NewMemoryEventStore()
+	taskCreationStore := store.NewMemoryTaskCreationStore(taskStore, eventStore)
+	service := application.NewTaskService(taskStore, eventStore, taskCreationStore)
 	return NewRouter(NewHandler(service))
 }

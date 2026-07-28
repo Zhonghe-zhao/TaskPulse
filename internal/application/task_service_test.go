@@ -12,7 +12,7 @@ import (
 
 func TestTaskServiceCreateTask(t *testing.T) {
 	ctx := context.Background()
-	service := NewTaskService(store.NewMemoryTaskStore(), store.NewMemoryEventStore())
+	service := newMemoryTaskService()
 
 	task, err := service.CreateTask(ctx, CreateTaskInput{
 		Workflow:   "url_check",
@@ -51,7 +51,7 @@ func TestTaskServiceCreateTask(t *testing.T) {
 
 func TestTaskServiceRejectsInvalidInput(t *testing.T) {
 	ctx := context.Background()
-	service := NewTaskService(store.NewMemoryTaskStore(), store.NewMemoryEventStore())
+	service := newMemoryTaskService()
 
 	_, err := service.CreateTask(ctx, CreateTaskInput{
 		Workflow: "",
@@ -64,10 +64,17 @@ func TestTaskServiceRejectsInvalidInput(t *testing.T) {
 
 func TestTaskServiceListTaskEventsRequiresExistingTask(t *testing.T) {
 	ctx := context.Background()
-	service := NewTaskService(store.NewMemoryTaskStore(), store.NewMemoryEventStore())
+	service := newMemoryTaskService()
 
 	_, err := service.ListTaskEvents(ctx, "missing_task")
 	if !errors.Is(err, store.ErrTaskNotFound) {
 		t.Fatalf("expected ErrTaskNotFound, got %v", err)
 	}
+}
+
+func newMemoryTaskService() *TaskService {
+	taskStore := store.NewMemoryTaskStore()
+	eventStore := store.NewMemoryEventStore()
+	taskCreationStore := store.NewMemoryTaskCreationStore(taskStore, eventStore)
+	return NewTaskService(taskStore, eventStore, taskCreationStore)
 }
