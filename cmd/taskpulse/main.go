@@ -11,7 +11,6 @@ import (
 
 	"github.com/zhaozhonghe/taskpulse/internal/application"
 	"github.com/zhaozhonghe/taskpulse/internal/executor/urlcheck"
-	"github.com/zhaozhonghe/taskpulse/internal/store"
 	httptransport "github.com/zhaozhonghe/taskpulse/internal/transport/http"
 	"github.com/zhaozhonghe/taskpulse/internal/worker"
 )
@@ -20,20 +19,29 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	taskStore := store.NewMemoryTaskStore()
-	eventStore := store.NewMemoryEventStore()
-	taskCreationStore := store.NewMemoryTaskCreationStore(taskStore, eventStore)
-	taskService := application.NewTaskService(taskStore, eventStore, taskCreationStore)
+	backend := normalizeStorageBackend(os.Getenv("TASKPULSE_STORAGE"))
+	stores, err := openRuntimeStores(ctx, backend)
+	if err != nil {
+		log.Fatalf("initialize %s storage: %v", backend, err)
+	}
+	defer func() {
+		if err := stores.close(); err != nil {
+			log.Printf("close %s storage: %v", backend, err)
+		}
+	}()
+	log.Printf("TaskPulse storage backend: %s", backend)
+
+	taskService := application.NewTaskService(stores.tasks, stores.events, stores.taskCreation)
 	router := httptransport.NewRouter(httptransport.NewHandler(taskService))
 
 	urlCheckExecutor := urlcheck.NewWithConcurrency(
 		&http.Client{Timeout: 10 * time.Second},
 		5,
 	)
-	taskWorker := worker.New(taskStore, eventStore, map[string]worker.Executor{
+	taskWorker := worker.New(stores.tasks, stores.events, map[string]worker.Executor{
 		"url_check": urlCheckExecutor,
 	})
-	taskReaper := worker.NewReaper(taskStore, eventStore)
+	taskReaper := worker.NewReaper(stores.tasks, stores.events)
 
 	backgroundErrors := make(chan error, 2)
 	go func() {
