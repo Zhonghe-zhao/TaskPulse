@@ -1,6 +1,7 @@
 package mysqlstore
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -171,11 +172,15 @@ func NewTaskStore(db *sql.DB) (*MySQLTaskStore, error) {
 }
 
 func (s *MySQLTaskStore) Create(ctx context.Context, task *domain.Task) error {
+	return insertTask(ctx, s.db, task)
+}
+
+func insertTask(ctx context.Context, executor sqlExecutor, task *domain.Task) error {
 	if task == nil {
 		return storeerrors.ErrNilTask
 	}
 
-	_, err := s.db.ExecContext(
+	_, err := executor.ExecContext(
 		ctx,
 		insertTaskQuery,
 		task.ID,
@@ -534,6 +539,11 @@ func timePointer(value sql.NullTime) *time.Time {
 func cloneJSON(value []byte) json.RawMessage {
 	if value == nil {
 		return nil
+	}
+	// MySQL JSON columns may reformat whitespace on read; compact keeps a stable byte form.
+	var compacted bytes.Buffer
+	if err := json.Compact(&compacted, value); err == nil {
+		return append(json.RawMessage(nil), compacted.Bytes()...)
 	}
 	return append(json.RawMessage(nil), value...)
 }

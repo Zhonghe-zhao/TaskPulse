@@ -63,7 +63,7 @@ func TestMySQLTaskStoreCreateAndGetIntegration(t *testing.T) {
 	if got.ID != task.ID || got.Workflow != task.Workflow || got.Status != task.Status {
 		t.Fatalf("unexpected stored task: %+v", got)
 	}
-	if string(got.Input) != string(task.Input) {
+	if !jsonEqual(got.Input, task.Input) {
 		t.Fatalf("expected input %s, got %s", task.Input, got.Input)
 	}
 	if !got.CreatedAt.Equal(task.CreatedAt) || !got.UpdatedAt.Equal(task.UpdatedAt) {
@@ -166,44 +166,61 @@ func TestMySQLTaskStoreClaimsTaskOnlyOnceIntegration(t *testing.T) {
 	if err := taskStore.Create(ctx, task); err != nil {
 		t.Fatalf("Create returned error: %v", err)
 	}
+	// Remove leftover claimable rows from earlier failed runs so ClaimNext only sees this task.
+	_, _ = db.ExecContext(ctx, `
+		DELETE FROM tasks
+		WHERE id <> ?
+		  AND (
+		    (status = ? AND available_at <= ?)
+		    OR (status = ? AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+		  )`,
+		taskID,
+		string(domain.TaskStatusQueued),
+		createdAt.Add(time.Second),
+		string(domain.TaskStatusRunning),
+		createdAt.Add(time.Second),
+	)
 
 	const claimers = 8
-	results := make(chan error, claimers)
-	var claimedTask *domain.Task
-	var claimedMu sync.Mutex
+	type claimResult struct {
+		task *domain.Task
+		err  error
+	}
+	results := make(chan claimResult, claimers)
 	var wg sync.WaitGroup
 	for i := 0; i < claimers; i++ {
 		wg.Add(1)
+		workerID := fmt.Sprintf("worker_%d", i)
 		go func() {
 			defer wg.Done()
 			claimed, claimErr := taskStore.ClaimNext(ctx, storeerrors.ClaimOptions{
 				Now:           createdAt.Add(time.Second),
 				LeaseDuration: time.Second,
-				WorkerID:      fmt.Sprintf("worker_%d", i),
+				WorkerID:      workerID,
 			})
-			if claimErr == nil {
-				claimedMu.Lock()
-				claimedTask = claimed
-				claimedMu.Unlock()
-			}
-			results <- claimErr
+			results <- claimResult{task: claimed, err: claimErr}
 		}()
 	}
 	wg.Wait()
 	close(results)
 
+	var claimedTask *domain.Task
 	successes := 0
-	for claimErr := range results {
-		if claimErr == nil {
+	for result := range results {
+		if result.err == nil {
+			if result.task == nil || result.task.ID != taskID {
+				t.Fatalf("ClaimNext returned unexpected task: %+v", result.task)
+			}
 			successes++
+			claimedTask = result.task
 			continue
 		}
-		if !errors.Is(claimErr, storeerrors.ErrNoTaskAvailable) {
-			t.Fatalf("unexpected ClaimNext error: %v", claimErr)
+		if !errors.Is(result.err, storeerrors.ErrNoTaskAvailable) {
+			t.Fatalf("unexpected ClaimNext error: %v", result.err)
 		}
 	}
 	if successes != 1 {
-		t.Fatalf("expected exactly one successful claim, got %d", successes)
+		t.Fatalf("expected exactly one successful claim of %s, got %d", taskID, successes)
 	}
 	if claimedTask == nil || claimedTask.Status != domain.TaskStatusRunning {
 		t.Fatalf("unexpected claimed task: %+v", claimedTask)
@@ -294,4 +311,24 @@ func TestMySQLTaskStoreClaimsTaskOnlyOnceIntegration(t *testing.T) {
 		failed.LeaseExpiresAt != nil {
 		t.Fatalf("unexpected failed expired task: %+v", failed)
 	}
+}
+
+func jsonEqual(left, right json.RawMessage) bool {
+	var leftValue any
+	var rightValue any
+	if err := json.Unmarshal(left, &leftValue); err != nil {
+		return false
+	}
+	if err := json.Unmarshal(right, &rightValue); err != nil {
+		return false
+	}
+	leftBytes, err := json.Marshal(leftValue)
+	if err != nil {
+		return false
+	}
+	rightBytes, err := json.Marshal(rightValue)
+	if err != nil {
+		return false
+	}
+	return string(leftBytes) == string(rightBytes)
 }
