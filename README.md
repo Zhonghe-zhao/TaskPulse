@@ -66,6 +66,37 @@ TaskPulse Core 中不能出现 URL 特有的业务规则。
 
 MemoBridge 不是 TaskPulse 第一版的依赖。未来 MemoBridge 真正出现批量链接检测、大型导出或 LLM 批处理需求时，再考虑接入。
 
+## 本地运行
+
+真实运行默认使用 MySQL。`compose.yaml` 第一次创建数据卷时会自动执行初始化迁移。
+
+```powershell
+docker compose up -d
+```
+
+应用直接读取进程环境变量，不会自动加载 `.env.example`。启动前需要在当前 PowerShell 设置 `MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_DATABASE` 等变量，然后运行：
+
+```powershell
+$env:TASKPULSE_STORAGE="mysql"
+go run ./cmd/taskpulse
+```
+
+服务启动日志必须出现：
+
+```text
+TaskPulse storage backend: mysql
+TaskPulse HTTP server listening on :8080
+```
+
+只有单元测试或不需要持久化的临时调试才显式使用：
+
+```powershell
+$env:TASKPULSE_STORAGE="memory"
+go run ./cmd/taskpulse
+```
+
+MySQL 连接失败时应用直接退出，不会静默退回内存存储。
+
 ## 开发演进路线
 
 ```text

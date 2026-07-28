@@ -1,8 +1,8 @@
 # TaskPulse 系统架构
 
 - 文档状态：当前架构说明
-- 最近更新：2026-07-23
-- 相关决策：[ADR-0001：使用 MySQL 8](adr/0001-use-mysql-as-system-of-record.md)
+- 最近更新：2026-07-28
+- 相关决策：[ADR-0001：使用 MySQL 8](adr/0001-use-mysql-as-system-of-record.md)、[ADR-0002：原子创建任务与初始事件](adr/0002-atomic-task-and-created-event.md)
 
 ## 架构目标
 
@@ -21,27 +21,28 @@ transport/http
   │ 解析 JSON、映射 HTTP 状态码
   ▼
 application.TaskService
-  │ 创建 Task、记录 task_created
-  ├──────────────┐
-  ▼              ▼
-TaskStore     EventStore
-  │              │
-  └──── Memory Store ────┐
-                         │ 共享内存
-                         ▼
-                    worker.Worker
-                         │ ClaimNext
-                         ▼
-                  Executor Registry
-                         │ workflow=url_check
-                         ▼
-                    URLCheckExecutor
-                         │ 最多 5 个并发 HTTP 请求
-                         ▼
-                 Result + TaskEvent
+  │ CreateTaskWithEvent
+  ▼
+MySQL TaskCreationStore
+  │ 同一事务写入 Task 与 task_created
+  ▼
+MySQL 8（Task/Event 真相源与任务队列）
+  ▲
+  │ ClaimNext / RenewLease / Update / FailNextExpired
+  │
+worker.Worker + Reaper
+  │
+  ▼
+Executor Registry
+  │ workflow=url_check
+  ▼
+URLCheckExecutor
+  │ 最多 5 个并发 HTTP 请求
+  ▼
+Result + TaskEvent
 ```
 
-API 创建任务后立即返回。后台 Worker 轮询 `TaskStore`，原子领取一个 queued 任务并调用对应 Executor。当前只有一个任务级 Worker，因此多个 Task 之间顺序执行；单个 URL Check Task 内部最多并发检测 5 个 URL。
+API 创建任务后立即返回。后台 Worker 使用 MySQL 事务原子领取任务并调用对应 Executor，通过租约心跳和版本号处理崩溃恢复与旧 Worker 隔离。Reaper 将重试额度耗尽的过期任务收敛为失败。单个进程当前只有一个任务级 Worker，因此多个 Task 之间顺序执行；单个 URL Check Task 内部最多并发检测 5 个 URL。
 
 ## 当前模块
 
@@ -50,12 +51,12 @@ API 创建任务后立即返回。后台 Worker 轮询 `TaskStore`，原子领�
 | 启动与组装 | `cmd/taskpulse` | 创建 Store、Service、Worker、Executor 和 HTTP Server |
 | Domain | `internal/domain` | Task、TaskEvent、状态机和合法状态流转 |
 | Application | `internal/application` | 编排创建任务、查询任务和查询事件用例 |
-| Store | `internal/store` | 定义存储接口，提供并发安全的内存实现 |
+| Store | `internal/store`、`internal/store/mysqlstore` | 定义存储接口，提供内存测试实现和 MySQL 运行实现 |
 | HTTP Transport | `internal/transport/http` | HTTP 路由、请求解析和响应映射 |
 | Worker | `internal/worker` | 领取任务、选择 Executor、保存结果和终态事件 |
 | URL Check Executor | `internal/executor/urlcheck` | 校验 URL、有界并发请求、汇总成功/部分成功/失败 |
 | Identity | `internal/identity` | 生成进程内唯一的 Task/Event ID |
-| Database Platform | `internal/platform/database` | MySQL 配置校验、连接池创建和连通性检查；当前尚未接入运行链路 |
+| Database Platform | `internal/platform/database` | MySQL 配置校验、连接池创建和连通性检查 |
 
 ## 依赖方向
 
@@ -84,8 +85,12 @@ store implementations → domain
 
 - HTTP 创建和查询任务、查询任务事件。
 - Task 状态机和终态判断。
-- 内存 Store 的并发保护和数据深复制。
-- 单进程内原子 `ClaimNext`，避免两个 goroutine 领取同一任务。
+- Memory Store 的并发保护和数据深复制。
+- MySQL 持久化 Task 与 TaskEvent。
+- Task 与 Created Event 的事务原子创建。
+- `FOR UPDATE SKIP LOCKED` 并发领取。
+- Worker 租约、心跳续租、过期接管和版本隔离。
+- 重试额度耗尽后的 Reaper 失败清理。
 - Worker 根据 workflow 选择 Executor。
 - URL 检测的有界并发、结果顺序保持和部分成功语义。
 - Context 传递、HTTP 超时和进程信号处理。
@@ -93,18 +98,15 @@ store implementations → domain
 
 ## 当前明确不具备的保证
 
-- 进程重启后任务不会丢失。
-- 多进程 Worker 不会重复领取任务。
-- Task 与 Event 原子写入。
-- Worker 崩溃后的租约恢复。
-- 幂等创建、自动重试、死信和任务取消。
-- 持久化进度事件和实时推送。
+- Worker 状态更新与运行事件尚未在同一事务提交。
+- 幂等创建、按错误类型自动重试、人工死信重放和任务取消尚未完成。
+- 实时事件推送尚未完成。
 - SSRF 防护；当前 URL Executor 不能直接暴露到公网。
-- Redis、Prometheus、Docker Compose 或 Kubernetes 运行能力。
+- Redis、Prometheus 或 Kubernetes 运行能力。
 
 这些是后续要通过实现和实验获得的能力，不能在项目介绍中表述为已经完成。
 
-## 下一阶段目标：MySQL 持久化
+## 当前持久化实现
 
 根据 ADR-0001，下一阶段仍保持模块化单体，只增加 MySQL Store：
 
@@ -118,7 +120,7 @@ TaskStore interface           EventStore interface
            用于真实运行                   用于真实运行
 ```
 
-第一阶段表模型只覆盖当前代码真实使用的 Task 与 TaskEvent：
+当前表模型覆盖代码真实使用的 Task 与 TaskEvent：
 
 ```text
 tasks

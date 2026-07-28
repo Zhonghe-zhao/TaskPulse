@@ -36,6 +36,7 @@
 - [x] 实现 MySQLTaskStore.ClaimNext
 - [x] 实现 MySQLEventStore.Append/ListByTaskID
 - [x] 在同一事务中创建 Task 和 Created Event
+- [x] 将 MySQL Store 接入 API、Worker 与 Reaper 运行链路
 - [ ] 使用唯一 `idempotency_key` 防止重复创建
 - [x] 使用 `FOR UPDATE SKIP LOCKED` 领取任务
 - [ ] 增加数据库集成测试
