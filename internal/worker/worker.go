@@ -31,26 +31,43 @@ type Executor interface {
 }
 
 type Worker struct {
-	taskStore     store.TaskStore
-	eventStore    store.EventStore
-	executors     map[string]Executor
-	id            string
-	leaseDuration time.Duration
-	now           func() time.Time
+	taskStore       store.TaskStore
+	transitionStore store.TaskTransitionStore
+	executors       map[string]Executor
+	retryPolicies   map[string]RetryPolicy
+	retryScheduler  *RetryScheduler
+	id              string
+	leaseDuration   time.Duration
+	now             func() time.Time
 }
 
 const defaultLeaseDuration = 30 * time.Second
 
-func New(taskStore store.TaskStore, eventStore store.EventStore, executors map[string]Executor) *Worker {
+func New(
+	taskStore store.TaskStore,
+	transitionStore store.TaskTransitionStore,
+	executors map[string]Executor,
+	retryPolicies map[string]RetryPolicy,
+) *Worker {
 	copiedExecutors := make(map[string]Executor, len(executors))
 	for workflow, executor := range executors {
 		copiedExecutors[workflow] = executor
 	}
+	copiedRetryPolicies := make(map[string]RetryPolicy, len(retryPolicies))
+	for workflow, policy := range retryPolicies {
+		copiedRetryPolicies[workflow] = policy
+	}
 
 	return &Worker{
-		taskStore:     taskStore,
-		eventStore:    eventStore,
-		executors:     copiedExecutors,
+		taskStore:       taskStore,
+		transitionStore: transitionStore,
+		executors:       copiedExecutors,
+		retryPolicies:   copiedRetryPolicies,
+		retryScheduler: &RetryScheduler{
+			transitionStore: transitionStore,
+			backoff:         NewDefaultBackoffCalculator(),
+			newEventID:      func() string { return identity.New("event") },
+		},
 		id:            identity.New("worker"),
 		leaseDuration: defaultLeaseDuration,
 		now:           time.Now,
@@ -60,26 +77,20 @@ func New(taskStore store.TaskStore, eventStore store.EventStore, executors map[s
 // 当前逻辑Worker从队列中领取任务 添加事件 识别工作流 执行相应任务
 func (w *Worker) ProcessNext(ctx context.Context) (bool, error) {
 	now := w.now()
-	task, err := w.taskStore.ClaimNext(ctx, store.ClaimOptions{
-		WorkerID:      w.id,
-		Now:           now,
-		LeaseDuration: w.leaseDuration,
-	})
+	task, err := w.transitionStore.ClaimNextWithEvent(
+		ctx,
+		store.ClaimOptions{
+			WorkerID:      w.id,
+			Now:           now,
+			LeaseDuration: w.leaseDuration,
+		},
+		identity.New("event"),
+	)
 	if errors.Is(err, store.ErrNoTaskAvailable) {
 		return false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("claim task: %w", err)
-	}
-
-	startedEventType := domain.EventTaskStarted
-	startedMessage := "task started"
-	if task.RetryCount > 0 {
-		startedEventType = domain.EventTaskRecovered
-		startedMessage = "task recovered after lease expiration"
-	}
-	if err := w.appendEvent(ctx, task, startedEventType, startedMessage); err != nil {
-		return true, fmt.Errorf("append task started event: %w", err)
+		return false, fmt.Errorf("claim task and append event: %w", err)
 	}
 
 	executor, exists := w.executors[task.Workflow]
@@ -92,6 +103,28 @@ func (w *Worker) ProcessNext(ctx context.Context) (bool, error) {
 	if executeErr != nil {
 		if errors.Is(executeErr, store.ErrLeaseLost) {
 			return true, executeErr
+		}
+		if executionError, ok := AsExecutionError(executeErr); ok {
+			if executionError.Retryable() {
+				policy, configured := w.retryPolicies[task.Workflow]
+				if configured {
+					scheduleErr := w.retryScheduler.Schedule(
+						ctx,
+						task,
+						executionError,
+						policy,
+						w.now(),
+					)
+					if scheduleErr == nil {
+						return true, nil
+					}
+					if !errors.Is(scheduleErr, domain.ErrRetryBudgetExhausted) &&
+						!errors.Is(scheduleErr, ErrInvalidRetryCount) {
+						return true, fmt.Errorf("schedule task retry: %w", scheduleErr)
+					}
+				}
+			}
+			executeErr = errors.New(executionError.Code)
 		}
 		return true, w.finishFailed(ctx, task, executeErr)
 	}
@@ -204,39 +237,48 @@ func (w *Worker) finishWithResult(ctx context.Context, task *domain.Task, result
 		return w.finishFailed(ctx, task, fmt.Errorf("invalid execution outcome %q", result.Outcome))
 	}
 
-	if err := task.MoveTo(status, w.now()); err != nil {
+	completedAt := w.now()
+	if err := task.MoveTo(status, completedAt); err != nil {
 		return fmt.Errorf("move task to %s: %w", status, err)
 	}
-	if err := w.taskStore.Update(ctx, task); err != nil {
-		return fmt.Errorf("save %s task: %w", status, err)
+	event, err := w.newEvent(task, eventType, message, completedAt)
+	if err != nil {
+		return fmt.Errorf("create %s event: %w", status, err)
 	}
-	if err := w.appendEvent(ctx, task, eventType, message); err != nil {
-		return fmt.Errorf("append %s event: %w", status, err)
+	if err := w.transitionStore.UpdateTaskWithEvent(ctx, task, event); err != nil {
+		return fmt.Errorf("save %s task and event: %w", status, err)
 	}
 	return nil
 }
 
 func (w *Worker) finishFailed(ctx context.Context, task *domain.Task, cause error) error {
 	task.ErrorMessage = cause.Error()
-	if err := task.MoveTo(domain.TaskStatusFailed, w.now()); err != nil {
+	failedAt := w.now()
+	if err := task.MoveTo(domain.TaskStatusFailed, failedAt); err != nil {
 		return fmt.Errorf("mark task failed: %w", err)
 	}
-	if err := w.taskStore.Update(ctx, task); err != nil {
-		return fmt.Errorf("save failed task: %w", err)
+	event, err := w.newEvent(task, domain.EventTaskFailed, "task failed", failedAt)
+	if err != nil {
+		return fmt.Errorf("create task failed event: %w", err)
 	}
-	if err := w.appendEvent(ctx, task, domain.EventTaskFailed, "task failed"); err != nil {
-		return fmt.Errorf("append task failed event: %w", err)
+	if err := w.transitionStore.UpdateTaskWithEvent(ctx, task, event); err != nil {
+		return fmt.Errorf("save failed task and event: %w", err)
 	}
 	return nil
 }
 
-func (w *Worker) appendEvent(ctx context.Context, task *domain.Task, eventType domain.EventType, message string) error {
+func (w *Worker) newEvent(
+	task *domain.Task,
+	eventType domain.EventType,
+	message string,
+	now time.Time,
+) (*domain.TaskEvent, error) {
 	event, err := domain.NewTaskEvent(
 		identity.New("event"), task.ID, eventType, message,
-		json.RawMessage("{}"), task.Progress, w.now(),
+		json.RawMessage("{}"), task.Progress, now,
 	)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return w.eventStore.Append(ctx, event)
+	return event, nil
 }

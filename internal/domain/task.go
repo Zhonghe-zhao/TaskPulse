@@ -25,6 +25,11 @@ var terminalStatuses = map[TaskStatus]bool{
 	TaskStatusCanceled:  true,
 }
 
+var (
+	ErrRetryBudgetExhausted = errors.New("task retry budget exhausted")
+	ErrInvalidRetryTime     = errors.New("retry time must be after current time")
+)
+
 type Task struct {
 	ID             string          `json:"id"`
 	Workflow       string          `json:"workflow"`
@@ -35,6 +40,7 @@ type Task struct {
 	Progress       int             `json:"progress"`
 	RetryCount     int             `json:"retry_count"`
 	MaxRetries     int             `json:"max_retries"`
+	AvailableAt    time.Time       `json:"available_at"`
 	Version        uint64          `json:"version"`
 	LeaseOwner     string          `json:"lease_owner,omitempty"`
 	LeaseExpiresAt *time.Time      `json:"lease_expires_at,omitempty"`
@@ -59,14 +65,15 @@ func NewTask(id, workflow string, input json.RawMessage, maxRetries int, now tim
 	}
 
 	return &Task{
-		ID:         id,
-		Workflow:   workflow,
-		Status:     TaskStatusQueued,
-		Input:      input,
-		Progress:   0,
-		MaxRetries: maxRetries,
-		CreatedAt:  now,
-		UpdatedAt:  now,
+		ID:          id,
+		Workflow:    workflow,
+		Status:      TaskStatusQueued,
+		Input:       input,
+		Progress:    0,
+		MaxRetries:  maxRetries,
+		AvailableAt: now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
 	}, nil
 }
 
@@ -86,12 +93,34 @@ func (t *Task) MoveTo(next TaskStatus, now time.Time) error {
 		if t.StartedAt == nil {
 			t.StartedAt = &now
 		}
+	case TaskStatusRetrying:
+		t.LeaseOwner = ""
+		t.LeaseExpiresAt = nil
 	case TaskStatusSucceeded, TaskStatusPartial, TaskStatusFailed, TaskStatusCanceled:
 		t.FinishedAt = &now
 		t.LeaseOwner = ""
 		t.LeaseExpiresAt = nil
 	}
 
+	return nil
+}
+
+func (t *Task) ScheduleRetry(now, availableAt time.Time) error {
+	if t == nil {
+		return errors.New("task is nil")
+	}
+	if !availableAt.After(now) {
+		return ErrInvalidRetryTime
+	}
+	if t.RetryCount >= t.MaxRetries {
+		return ErrRetryBudgetExhausted
+	}
+	if err := t.MoveTo(TaskStatusRetrying, now); err != nil {
+		return err
+	}
+
+	t.RetryCount++
+	t.AvailableAt = availableAt
 	return nil
 }
 

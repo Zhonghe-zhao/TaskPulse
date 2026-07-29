@@ -55,7 +55,8 @@ func TestReaperFailsExpiredTaskAfterRetryBudgetExhausted(t *testing.T) {
 	}
 
 	expiredAt := claimedAt.Add(time.Minute)
-	reaper := NewReaper(taskStore, eventStore)
+	transitionStore := store.NewMemoryTaskTransitionStore(taskStore, eventStore)
+	reaper := NewReaper(transitionStore)
 	reaper.now = func() time.Time { return expiredAt }
 	processed, err := reaper.ProcessNext(ctx)
 	if err != nil {

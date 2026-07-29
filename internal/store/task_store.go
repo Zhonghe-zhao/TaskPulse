@@ -19,6 +19,7 @@ var (
 	ErrLeaseLost           = errors.New("task lease lost")
 	ErrNoExpiredTask       = errors.New("no expired task awaiting cleanup")
 	ErrInvalidCleanupTime  = errors.New("invalid task cleanup time")
+	ErrInvalidEventID      = errors.New("event id is required")
 )
 
 type ClaimOptions struct {

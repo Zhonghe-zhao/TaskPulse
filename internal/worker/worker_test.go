@@ -22,6 +22,19 @@ type delayedExecutor struct {
 	result ExecutionResult
 }
 
+type retryOnceExecutor struct {
+	calls      atomic.Int32
+	firstErr   error
+	thenResult ExecutionResult
+}
+
+func (e *retryOnceExecutor) Execute(context.Context, *domain.Task) (ExecutionResult, error) {
+	if e.calls.Add(1) == 1 {
+		return ExecutionResult{}, e.firstErr
+	}
+	return e.thenResult, nil
+}
+
 func (e delayedExecutor) Execute(ctx context.Context, _ *domain.Task) (ExecutionResult, error) {
 	timer := time.NewTimer(e.delay)
 	defer timer.Stop()
@@ -60,13 +73,14 @@ func TestWorkerCompletesTask(t *testing.T) {
 	taskStore := store.NewMemoryTaskStore()
 	eventStore := store.NewMemoryEventStore()
 	task := createTask(t, taskStore, eventStore)
+	transitionStore := store.NewMemoryTaskTransitionStore(taskStore, eventStore)
 
-	w := New(taskStore, eventStore, map[string]Executor{
+	w := New(taskStore, transitionStore, map[string]Executor{
 		"url_check": fakeExecutor{result: ExecutionResult{
 			Output:  json.RawMessage(`{"checked":1}`),
 			Outcome: OutcomeSucceeded,
 		}},
-	})
+	}, nil)
 	processed, err := w.ProcessNext(ctx)
 	if err != nil {
 		t.Fatalf("ProcessNext returned error: %v", err)
@@ -103,14 +117,15 @@ func TestWorkerPreservesPartialResult(t *testing.T) {
 	taskStore := store.NewMemoryTaskStore()
 	eventStore := store.NewMemoryEventStore()
 	task := createTask(t, taskStore, eventStore)
+	transitionStore := store.NewMemoryTaskTransitionStore(taskStore, eventStore)
 
-	w := New(taskStore, eventStore, map[string]Executor{
+	w := New(taskStore, transitionStore, map[string]Executor{
 		"url_check": fakeExecutor{result: ExecutionResult{
 			Output:       json.RawMessage(`{"succeeded":1,"failed":1}`),
 			Outcome:      OutcomePartial,
 			ErrorMessage: "1 of 2 URL checks failed",
 		}},
-	})
+	}, nil)
 	if _, err := w.ProcessNext(ctx); err != nil {
 		t.Fatalf("ProcessNext returned error: %v", err)
 	}
@@ -132,10 +147,11 @@ func TestWorkerMarksExecutionFailure(t *testing.T) {
 	taskStore := store.NewMemoryTaskStore()
 	eventStore := store.NewMemoryEventStore()
 	task := createTask(t, taskStore, eventStore)
+	transitionStore := store.NewMemoryTaskTransitionStore(taskStore, eventStore)
 
-	w := New(taskStore, eventStore, map[string]Executor{
+	w := New(taskStore, transitionStore, map[string]Executor{
 		"url_check": fakeExecutor{err: errors.New("request timed out")},
-	})
+	}, nil)
 	processed, err := w.ProcessNext(ctx)
 	if err != nil {
 		t.Fatalf("ProcessNext returned error: %v", err)
@@ -153,8 +169,168 @@ func TestWorkerMarksExecutionFailure(t *testing.T) {
 	}
 }
 
+func TestWorkerRetriesTransientFailureAndThenSucceeds(t *testing.T) {
+	ctx := context.Background()
+	taskStore := store.NewMemoryTaskStore()
+	eventStore := store.NewMemoryEventStore()
+	task := createTaskForWorkflow(t, taskStore, eventStore, "llm_analysis")
+	transitionStore := store.NewMemoryTaskTransitionStore(taskStore, eventStore)
+	executionError, err := NewExecutionError(
+		ErrorTransient,
+		"rate_limited",
+		0,
+		errors.New("provider returned 429"),
+	)
+	if err != nil {
+		t.Fatalf("NewExecutionError returned error: %v", err)
+	}
+	executor := &retryOnceExecutor{
+		firstErr: executionError,
+		thenResult: ExecutionResult{
+			Output:  json.RawMessage(`{"answer":"ok"}`),
+			Outcome: OutcomeSucceeded,
+		},
+	}
+	w := New(
+		taskStore,
+		transitionStore,
+		map[string]Executor{"llm_analysis": executor},
+		map[string]RetryPolicy{
+			"llm_analysis": {
+				MaxRetries: 3,
+				BaseDelay:  2 * time.Second,
+				MaxDelay:   8 * time.Second,
+			},
+		},
+	)
+	calculator, err := NewBackoffCalculator(minimumJitter{})
+	if err != nil {
+		t.Fatalf("NewBackoffCalculator returned error: %v", err)
+	}
+	w.retryScheduler, err = NewRetryScheduler(transitionStore, calculator)
+	if err != nil {
+		t.Fatalf("NewRetryScheduler returned error: %v", err)
+	}
+
+	firstAttemptAt := task.CreatedAt.Add(time.Second)
+	w.now = func() time.Time { return firstAttemptAt }
+	processed, err := w.ProcessNext(ctx)
+	if err != nil {
+		t.Fatalf("first ProcessNext returned error: %v", err)
+	}
+	if !processed {
+		t.Fatal("expected first attempt to be processed")
+	}
+	retrying, err := taskStore.Get(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("Get retrying task returned error: %v", err)
+	}
+	expectedRetryAt := firstAttemptAt.Add(time.Second)
+	if retrying.Status != domain.TaskStatusRetrying ||
+		retrying.RetryCount != 1 ||
+		!retrying.AvailableAt.Equal(expectedRetryAt) {
+		t.Fatalf("unexpected retrying task: %+v", retrying)
+	}
+
+	w.now = func() time.Time { return expectedRetryAt }
+	processed, err = w.ProcessNext(ctx)
+	if err != nil {
+		t.Fatalf("second ProcessNext returned error: %v", err)
+	}
+	if !processed {
+		t.Fatal("expected retry attempt to be processed")
+	}
+	succeeded, err := taskStore.Get(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("Get succeeded task returned error: %v", err)
+	}
+	if succeeded.Status != domain.TaskStatusSucceeded ||
+		succeeded.RetryCount != 1 ||
+		executor.calls.Load() != 2 {
+		t.Fatalf("unexpected succeeded task or call count: task=%+v calls=%d", succeeded, executor.calls.Load())
+	}
+	events, err := eventStore.ListByTaskID(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("ListByTaskID returned error: %v", err)
+	}
+	wantTypes := []domain.EventType{
+		domain.EventTaskCreated,
+		domain.EventTaskStarted,
+		domain.EventTaskRetrying,
+		domain.EventTaskRetryStarted,
+		domain.EventTaskSucceeded,
+	}
+	if len(events) != len(wantTypes) {
+		t.Fatalf("expected %d events, got %d: %+v", len(wantTypes), len(events), events)
+	}
+	for index, wantType := range wantTypes {
+		if events[index].Type != wantType {
+			t.Fatalf("event %d: expected %s, got %s", index, wantType, events[index].Type)
+		}
+	}
+}
+
+func TestWorkerFailsTransientErrorWhenRetryBudgetIsExhausted(t *testing.T) {
+	ctx := context.Background()
+	taskStore := store.NewMemoryTaskStore()
+	eventStore := store.NewMemoryEventStore()
+	task := createTaskForWorkflow(t, taskStore, eventStore, "llm_analysis")
+	transitionStore := store.NewMemoryTaskTransitionStore(taskStore, eventStore)
+	executionError, err := NewExecutionError(
+		ErrorTransient,
+		"rate_limited",
+		0,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("NewExecutionError returned error: %v", err)
+	}
+	w := New(
+		taskStore,
+		transitionStore,
+		map[string]Executor{
+			"llm_analysis": fakeExecutor{err: executionError},
+		},
+		map[string]RetryPolicy{
+			"llm_analysis": {
+				MaxRetries: 0,
+				BaseDelay:  time.Second,
+				MaxDelay:   time.Minute,
+			},
+		},
+	)
+	w.now = func() time.Time { return task.CreatedAt.Add(time.Second) }
+
+	processed, err := w.ProcessNext(ctx)
+	if err != nil {
+		t.Fatalf("ProcessNext returned error: %v", err)
+	}
+	if !processed {
+		t.Fatal("expected task to be processed")
+	}
+	failed, err := taskStore.Get(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("Get returned error: %v", err)
+	}
+	if failed.Status != domain.TaskStatusFailed ||
+		failed.RetryCount != 0 ||
+		failed.ErrorMessage != "rate_limited" {
+		t.Fatalf("unexpected failed task: %+v", failed)
+	}
+	events, err := eventStore.ListByTaskID(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("ListByTaskID returned error: %v", err)
+	}
+	if len(events) != 3 || events[2].Type != domain.EventTaskFailed {
+		t.Fatalf("unexpected exhausted retry events: %+v", events)
+	}
+}
+
 func TestWorkerReturnsNoWork(t *testing.T) {
-	w := New(store.NewMemoryTaskStore(), store.NewMemoryEventStore(), nil)
+	taskStore := store.NewMemoryTaskStore()
+	eventStore := store.NewMemoryEventStore()
+	transitionStore := store.NewMemoryTaskTransitionStore(taskStore, eventStore)
+	w := New(taskStore, transitionStore, nil, nil)
 	processed, err := w.ProcessNext(context.Background())
 	if err != nil {
 		t.Fatalf("ProcessNext returned error: %v", err)
@@ -170,8 +346,9 @@ func TestWorkerRenewsLeaseDuringLongExecution(t *testing.T) {
 	taskStore := &countingTaskStore{TaskStore: memoryStore}
 	eventStore := store.NewMemoryEventStore()
 	createTask(t, taskStore, eventStore)
+	transitionStore := store.NewMemoryTaskTransitionStore(memoryStore, eventStore)
 
-	w := New(taskStore, eventStore, map[string]Executor{
+	w := New(taskStore, transitionStore, map[string]Executor{
 		"url_check": delayedExecutor{
 			delay: 80 * time.Millisecond,
 			result: ExecutionResult{
@@ -179,7 +356,7 @@ func TestWorkerRenewsLeaseDuringLongExecution(t *testing.T) {
 				Outcome: OutcomeSucceeded,
 			},
 		},
-	})
+	}, nil)
 	w.leaseDuration = 60 * time.Millisecond
 
 	processed, err := w.ProcessNext(ctx)
@@ -200,15 +377,16 @@ func TestWorkerStopsWritingAfterLeaseIsLost(t *testing.T) {
 	taskStore := &lostLeaseTaskStore{TaskStore: memoryStore}
 	eventStore := store.NewMemoryEventStore()
 	task := createTask(t, taskStore, eventStore)
+	transitionStore := store.NewMemoryTaskTransitionStore(memoryStore, eventStore)
 
-	w := New(taskStore, eventStore, map[string]Executor{
+	w := New(taskStore, transitionStore, map[string]Executor{
 		"url_check": delayedExecutor{
 			delay: time.Second,
 			result: ExecutionResult{
 				Outcome: OutcomeSucceeded,
 			},
 		},
-	})
+	}, nil)
 	w.leaseDuration = 15 * time.Millisecond
 
 	processed, err := w.ProcessNext(ctx)
@@ -233,6 +411,7 @@ func TestWorkerEmitsRecoveredEventForExpiredTask(t *testing.T) {
 	taskStore := store.NewMemoryTaskStore()
 	eventStore := store.NewMemoryEventStore()
 	task := createTask(t, taskStore, eventStore)
+	transitionStore := store.NewMemoryTaskTransitionStore(taskStore, eventStore)
 
 	claimedAt := task.CreatedAt.Add(time.Minute)
 	if _, err := taskStore.ClaimNext(ctx, store.ClaimOptions{
@@ -244,12 +423,12 @@ func TestWorkerEmitsRecoveredEventForExpiredTask(t *testing.T) {
 	}
 
 	recoveredAt := claimedAt.Add(time.Minute)
-	w := New(taskStore, eventStore, map[string]Executor{
+	w := New(taskStore, transitionStore, map[string]Executor{
 		"url_check": fakeExecutor{result: ExecutionResult{
 			Output:  json.RawMessage(`{"checked":1}`),
 			Outcome: OutcomeSucceeded,
 		}},
-	})
+	}, nil)
 	w.id = "recovery_worker"
 	w.leaseDuration = time.Minute
 	w.now = func() time.Time { return recoveredAt }
@@ -275,9 +454,24 @@ func TestWorkerEmitsRecoveredEventForExpiredTask(t *testing.T) {
 }
 
 func createTask(t *testing.T, taskStore store.TaskStore, eventStore store.EventStore) *domain.Task {
+	return createTaskForWorkflow(t, taskStore, eventStore, "url_check")
+}
+
+func createTaskForWorkflow(
+	t *testing.T,
+	taskStore store.TaskStore,
+	eventStore store.EventStore,
+	workflow string,
+) *domain.Task {
 	t.Helper()
 	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
-	task, err := domain.NewTask("task_1", "url_check", json.RawMessage(`{"urls":["https://example.com"]}`), 3, now)
+	task, err := domain.NewTask(
+		"task_1",
+		workflow,
+		json.RawMessage(`{"input":"test"}`),
+		3,
+		now,
+	)
 	if err != nil {
 		t.Fatalf("NewTask returned error: %v", err)
 	}

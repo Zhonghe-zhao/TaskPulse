@@ -2,6 +2,7 @@ package domain
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 )
@@ -20,7 +21,7 @@ func TestNewTaskDefaultsToQueued(t *testing.T) {
 	if task.Progress != 0 {
 		t.Fatalf("expected progress 0, got %d", task.Progress)
 	}
-	if task.CreatedAt != now || task.UpdatedAt != now {
+	if task.AvailableAt != now || task.CreatedAt != now || task.UpdatedAt != now {
 		t.Fatalf("expected timestamps to equal now")
 	}
 }
@@ -83,5 +84,71 @@ func TestRunningTaskCanPartiallySucceed(t *testing.T) {
 	}
 	if !task.IsTerminal() {
 		t.Fatalf("expected partially succeeded task to be terminal")
+	}
+}
+
+func TestTaskSchedulesRetryAndClearsLease(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	task, err := NewTask("task_1", "llm_analysis", nil, 3, now)
+	if err != nil {
+		t.Fatalf("NewTask returned error: %v", err)
+	}
+	runningAt := now.Add(time.Second)
+	if err := task.MoveTo(TaskStatusRunning, runningAt); err != nil {
+		t.Fatalf("MoveTo running returned error: %v", err)
+	}
+	leaseExpiresAt := runningAt.Add(time.Minute)
+	task.LeaseOwner = "worker_1"
+	task.LeaseExpiresAt = &leaseExpiresAt
+
+	retryAt := runningAt.Add(10 * time.Second)
+	if err := task.ScheduleRetry(runningAt, retryAt); err != nil {
+		t.Fatalf("ScheduleRetry returned error: %v", err)
+	}
+	if task.Status != TaskStatusRetrying ||
+		task.RetryCount != 1 ||
+		!task.AvailableAt.Equal(retryAt) {
+		t.Fatalf("unexpected retrying task: %+v", task)
+	}
+	if task.LeaseOwner != "" || task.LeaseExpiresAt != nil {
+		t.Fatalf("expected retrying task lease to be cleared: %+v", task)
+	}
+}
+
+func TestTaskRejectsRetryWithoutBudget(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	task, err := NewTask("task_1", "llm_analysis", nil, 0, now)
+	if err != nil {
+		t.Fatalf("NewTask returned error: %v", err)
+	}
+	if err := task.MoveTo(TaskStatusRunning, now); err != nil {
+		t.Fatalf("MoveTo running returned error: %v", err)
+	}
+
+	err = task.ScheduleRetry(now, now.Add(time.Second))
+	if !errors.Is(err, ErrRetryBudgetExhausted) {
+		t.Fatalf("expected ErrRetryBudgetExhausted, got %v", err)
+	}
+	if task.Status != TaskStatusRunning || task.RetryCount != 0 {
+		t.Fatalf("rejected retry changed task: %+v", task)
+	}
+}
+
+func TestTaskRejectsRetryTimeThatIsNotInFuture(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	task, err := NewTask("task_1", "llm_analysis", nil, 1, now)
+	if err != nil {
+		t.Fatalf("NewTask returned error: %v", err)
+	}
+	if err := task.MoveTo(TaskStatusRunning, now); err != nil {
+		t.Fatalf("MoveTo running returned error: %v", err)
+	}
+
+	err = task.ScheduleRetry(now, now)
+	if !errors.Is(err, ErrInvalidRetryTime) {
+		t.Fatalf("expected ErrInvalidRetryTime, got %v", err)
+	}
+	if task.Status != TaskStatusRunning || task.RetryCount != 0 {
+		t.Fatalf("rejected retry changed task: %+v", task)
 	}
 }

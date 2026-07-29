@@ -17,10 +17,11 @@ const (
 )
 
 type runtimeStores struct {
-	tasks        store.TaskStore
-	events       store.EventStore
-	taskCreation store.TaskCreationStore
-	close        func() error
+	tasks          store.TaskStore
+	events         store.EventStore
+	taskCreation   store.TaskCreationStore
+	taskTransition store.TaskTransitionStore
+	close          func() error
 }
 
 func openRuntimeStores(ctx context.Context, backend string) (runtimeStores, error) {
@@ -29,10 +30,11 @@ func openRuntimeStores(ctx context.Context, backend string) (runtimeStores, erro
 		taskStore := store.NewMemoryTaskStore()
 		eventStore := store.NewMemoryEventStore()
 		return runtimeStores{
-			tasks:        taskStore,
-			events:       eventStore,
-			taskCreation: store.NewMemoryTaskCreationStore(taskStore, eventStore),
-			close:        func() error { return nil },
+			tasks:          taskStore,
+			events:         eventStore,
+			taskCreation:   store.NewMemoryTaskCreationStore(taskStore, eventStore),
+			taskTransition: store.NewMemoryTaskTransitionStore(taskStore, eventStore),
+			close:          func() error { return nil },
 		}, nil
 
 	case storageBackendMySQL:
@@ -60,11 +62,17 @@ func openRuntimeStores(ctx context.Context, backend string) (runtimeStores, erro
 			_ = db.Close()
 			return runtimeStores{}, err
 		}
+		taskTransitionStore, err := mysqlstore.NewTaskTransitionStore(db)
+		if err != nil {
+			_ = db.Close()
+			return runtimeStores{}, err
+		}
 		return runtimeStores{
-			tasks:        taskStore,
-			events:       eventStore,
-			taskCreation: taskCreationStore,
-			close:        db.Close,
+			tasks:          taskStore,
+			events:         eventStore,
+			taskCreation:   taskCreationStore,
+			taskTransition: taskTransitionStore,
+			close:          db.Close,
 		}, nil
 
 	default:

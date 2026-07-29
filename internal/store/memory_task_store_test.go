@@ -296,6 +296,36 @@ func TestMemoryTaskStoreClaimNext(t *testing.T) {
 	}
 }
 
+func TestMemoryTaskStoreWaitsUntilTaskIsAvailable(t *testing.T) {
+	ctx := context.Background()
+	taskStore := NewMemoryTaskStore()
+	task := newTestTask(t, "task_1")
+	task.AvailableAt = task.CreatedAt.Add(time.Hour)
+	if err := taskStore.Create(ctx, task); err != nil {
+		t.Fatalf("Create returned error: %v", err)
+	}
+
+	if _, err := taskStore.ClaimNext(ctx, ClaimOptions{
+		WorkerID:      "worker_1",
+		Now:           task.AvailableAt.Add(-time.Nanosecond),
+		LeaseDuration: time.Minute,
+	}); !errors.Is(err, ErrNoTaskAvailable) {
+		t.Fatalf("expected task not to be available yet, got %v", err)
+	}
+
+	claimed, err := taskStore.ClaimNext(ctx, ClaimOptions{
+		WorkerID:      "worker_1",
+		Now:           task.AvailableAt,
+		LeaseDuration: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("ClaimNext at available time returned error: %v", err)
+	}
+	if claimed.ID != task.ID {
+		t.Fatalf("expected task %s, got %s", task.ID, claimed.ID)
+	}
+}
+
 func TestMemoryTaskStoreRejectsInvalidClaim(t *testing.T) {
 	taskStore := NewMemoryTaskStore()
 	_, err := taskStore.ClaimNext(context.Background(), ClaimOptions{})

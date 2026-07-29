@@ -66,14 +66,23 @@ func TestMySQLTaskStoreCreateAndGetIntegration(t *testing.T) {
 	if !jsonEqual(got.Input, task.Input) {
 		t.Fatalf("expected input %s, got %s", task.Input, got.Input)
 	}
-	if !got.CreatedAt.Equal(task.CreatedAt) || !got.UpdatedAt.Equal(task.UpdatedAt) {
-		t.Fatalf("task timestamps changed: created=%s updated=%s", got.CreatedAt, got.UpdatedAt)
+	if !got.AvailableAt.Equal(task.AvailableAt) ||
+		!got.CreatedAt.Equal(task.CreatedAt) ||
+		!got.UpdatedAt.Equal(task.UpdatedAt) {
+		t.Fatalf(
+			"task timestamps changed: available=%s created=%s updated=%s",
+			got.AvailableAt,
+			got.CreatedAt,
+			got.UpdatedAt,
+		)
 	}
 	stale := *got
 	startedAt := now.Add(time.Second)
+	nextAvailableAt := now.Add(time.Minute)
 	if err := got.MoveTo(domain.TaskStatusRunning, startedAt); err != nil {
 		t.Fatalf("MoveTo returned error: %v", err)
 	}
+	got.AvailableAt = nextAvailableAt
 	if err := taskStore.Update(ctx, got); err != nil {
 		t.Fatalf("Update returned error: %v", err)
 	}
@@ -87,6 +96,9 @@ func TestMySQLTaskStoreCreateAndGetIntegration(t *testing.T) {
 	}
 	if updated.StartedAt == nil || !updated.StartedAt.Equal(startedAt) {
 		t.Fatalf("expected started_at %s, got %v", startedAt, updated.StartedAt)
+	}
+	if !updated.AvailableAt.Equal(nextAvailableAt) {
+		t.Fatalf("expected available_at %s, got %s", nextAvailableAt, updated.AvailableAt)
 	}
 
 	stale.Progress = 50

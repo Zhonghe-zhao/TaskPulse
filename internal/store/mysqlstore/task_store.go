@@ -43,6 +43,7 @@ SELECT
     progress,
     retry_count,
     max_retries,
+    available_at,
     lease_owner,
     lease_expires_at,
     version,
@@ -64,6 +65,7 @@ SELECT
     progress,
     retry_count,
     max_retries,
+    available_at,
     lease_owner,
     lease_expires_at,
     version,
@@ -72,7 +74,7 @@ SELECT
     started_at,
     finished_at
 FROM tasks
-WHERE status = ?
+WHERE status IN (?, ?)
   AND available_at <= ?
 ORDER BY available_at, created_at, id
 LIMIT 1
@@ -89,6 +91,7 @@ SELECT
     progress,
     retry_count,
     max_retries,
+    available_at,
     lease_owner,
     lease_expires_at,
     version,
@@ -113,6 +116,7 @@ SET
     progress = ?,
     retry_count = ?,
     max_retries = ?,
+    available_at = ?,
     lease_owner = ?,
     lease_expires_at = ?,
     updated_at = ?,
@@ -143,6 +147,7 @@ SELECT
     progress,
     retry_count,
     max_retries,
+    available_at,
     lease_owner,
     lease_expires_at,
     version,
@@ -192,7 +197,7 @@ func insertTask(ctx context.Context, executor sqlExecutor, task *domain.Task) er
 		task.Progress,
 		task.RetryCount,
 		task.MaxRetries,
-		task.CreatedAt.UTC(),
+		task.AvailableAt.UTC(),
 		task.CreatedAt.UTC(),
 		task.UpdatedAt.UTC(),
 		nullableTime(task.StartedAt),
@@ -233,6 +238,21 @@ func (s *MySQLTaskStore) ClaimNext(ctx context.Context, options storeerrors.Clai
 		}
 	}()
 
+	task, _, err := claimNextInTx(ctx, tx, options)
+	if err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit claimed task %q: %w", task.ID, err)
+	}
+	return task, nil
+}
+
+func claimNextInTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	options storeerrors.ClaimOptions,
+) (*domain.Task, domain.ClaimKind, error) {
 	now := options.Now.UTC() //统一时间
 	//优先查询过期任务
 	task, err := scanTask(tx.QueryRowContext(
@@ -241,26 +261,35 @@ func (s *MySQLTaskStore) ClaimNext(ctx context.Context, options storeerrors.Clai
 		string(domain.TaskStatusRunning),
 		now,
 	))
-	recovering := err == nil           //当前领取到的任务，不是普通 queued 任务，而是一个租约过期的 running 任务。
-	if errors.Is(err, sql.ErrNoRows) { //如果没有过期任务则查询queue任务
+	claimKind := domain.ClaimRecovery // 优先接管租约过期的 running 任务。
+	if errors.Is(err, sql.ErrNoRows) {
+		// 没有可恢复任务时，再查询已到期的 queued/retrying 任务。
 		task, err = scanTask(tx.QueryRowContext(
 			ctx,
 			claimNextTaskQuery,
 			string(domain.TaskStatusQueued),
+			string(domain.TaskStatusRetrying),
 			now,
 		))
+		if err == nil {
+			if task.Status == domain.TaskStatusRetrying {
+				claimKind = domain.ClaimRetry
+			} else {
+				claimKind = domain.ClaimInitial
+			}
+		}
 	}
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, storeerrors.ErrNoTaskAvailable
+		return nil, "", storeerrors.ErrNoTaskAvailable
 	}
 	if err != nil {
-		return nil, fmt.Errorf("select next task for claim: %w", err)
+		return nil, "", fmt.Errorf("select next task for claim: %w", err)
 	}
-	if recovering {
+	if claimKind == domain.ClaimRecovery {
 		task.RetryCount++
 		task.UpdatedAt = now
 	} else if err = task.MoveTo(domain.TaskStatusRunning, now); err != nil {
-		return nil, fmt.Errorf("move claimed task %q to running: %w", task.ID, err)
+		return nil, "", fmt.Errorf("move claimed task %q to running: %w", task.ID, err)
 	}
 	leaseExpiresAt := now.Add(options.LeaseDuration)
 	task.LeaseOwner = options.WorkerID
@@ -282,26 +311,23 @@ func (s *MySQLTaskStore) ClaimNext(ctx context.Context, options storeerrors.Clai
 		task.Version,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("mark claimed task %q as running: %w", task.ID, err)
+		return nil, "", fmt.Errorf("mark claimed task %q as running: %w", task.ID, err)
 	}
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
-		return nil, fmt.Errorf("read claimed row count for task %q: %w", task.ID, err)
+		return nil, "", fmt.Errorf("read claimed row count for task %q: %w", task.ID, err)
 	}
 	if rowsAffected != 1 {
-		return nil, fmt.Errorf(
+		return nil, "", fmt.Errorf(
 			"claim task %q at version %d affected %d rows",
 			task.ID,
 			task.Version,
 			rowsAffected,
 		)
 	}
-	if err = tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit claimed task %q: %w", task.ID, err)
-	}
 
 	task.Version++
-	return task, nil
+	return task, claimKind, nil
 }
 
 type rowScanner interface {
@@ -329,6 +355,7 @@ func scanTask(row rowScanner) (*domain.Task, error) {
 		&task.Progress,
 		&task.RetryCount,
 		&task.MaxRetries,
+		&task.AvailableAt,
 		&leaseOwner,
 		&leaseExpiresAt,
 		&task.Version,
@@ -351,6 +378,7 @@ func scanTask(row rowScanner) (*domain.Task, error) {
 		task.LeaseOwner = leaseOwner.String
 	}
 	task.LeaseExpiresAt = timePointer(leaseExpiresAt)
+	task.AvailableAt = task.AvailableAt.UTC()
 	task.CreatedAt = task.CreatedAt.UTC()
 	task.UpdatedAt = task.UpdatedAt.UTC()
 	task.StartedAt = timePointer(startedAt)
@@ -359,11 +387,15 @@ func scanTask(row rowScanner) (*domain.Task, error) {
 }
 
 func (s *MySQLTaskStore) Update(ctx context.Context, task *domain.Task) error {
+	return updateTask(ctx, s.db, task)
+}
+
+func updateTask(ctx context.Context, executor sqlQueryExecutor, task *domain.Task) error {
 	if task == nil {
 		return storeerrors.ErrNilTask
 	}
 
-	result, err := s.db.ExecContext(
+	result, err := executor.ExecContext(
 		ctx,
 		updateTaskQuery,
 		string(task.Status),
@@ -372,6 +404,7 @@ func (s *MySQLTaskStore) Update(ctx context.Context, task *domain.Task) error {
 		task.Progress,
 		task.RetryCount,
 		task.MaxRetries,
+		task.AvailableAt.UTC(),
 		nullableString(task.LeaseOwner),
 		nullableTime(task.LeaseExpiresAt),
 		task.UpdatedAt.UTC(),
@@ -396,7 +429,7 @@ func (s *MySQLTaskStore) Update(ctx context.Context, task *domain.Task) error {
 	}
 
 	var exists int
-	err = s.db.QueryRowContext(ctx, "SELECT 1 FROM tasks WHERE id = ?", task.ID).Scan(&exists)
+	err = executor.QueryRowContext(ctx, "SELECT 1 FROM tasks WHERE id = ?", task.ID).Scan(&exists)
 	if errors.Is(err, sql.ErrNoRows) {
 		return storeerrors.ErrTaskNotFound
 	}
@@ -441,7 +474,6 @@ func (s *MySQLTaskStore) FailNextExpired(ctx context.Context, now time.Time) (_ 
 	if now.IsZero() {
 		return nil, storeerrors.ErrInvalidCleanupTime
 	}
-	now = now.UTC()
 
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
@@ -453,6 +485,22 @@ func (s *MySQLTaskStore) FailNextExpired(ctx context.Context, now time.Time) (_ 
 		}
 	}()
 
+	task, err := failNextExpiredInTx(ctx, tx, now)
+	if err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit expired task %q cleanup: %w", task.ID, err)
+	}
+	return task, nil
+}
+
+func failNextExpiredInTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	now time.Time,
+) (*domain.Task, error) {
+	now = now.UTC()
 	task, err := scanTask(tx.QueryRowContext(
 		ctx,
 		selectExpiredExhaustedTaskQuery,
@@ -498,9 +546,6 @@ func (s *MySQLTaskStore) FailNextExpired(ctx context.Context, now time.Time) (_ 
 			task.Version,
 			rowsAffected,
 		)
-	}
-	if err = tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit expired task %q cleanup: %w", task.ID, err)
 	}
 
 	task.Version++

@@ -38,10 +38,10 @@ func main() {
 		&http.Client{Timeout: 10 * time.Second},
 		5,
 	)
-	taskWorker := worker.New(stores.tasks, stores.events, map[string]worker.Executor{
+	taskWorker := worker.New(stores.tasks, stores.taskTransition, map[string]worker.Executor{
 		"url_check": urlCheckExecutor,
-	})
-	taskReaper := worker.NewReaper(stores.tasks, stores.events)
+	}, nil)
+	taskReaper := worker.NewReaper(stores.taskTransition)
 
 	backgroundErrors := make(chan error, 2)
 	go func() {

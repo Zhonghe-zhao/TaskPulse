@@ -91,8 +91,16 @@ func (s *MemoryTaskStore) ClaimNext(ctx context.Context, options ClaimOptions) (
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	task, _, _, err := s.claimNextLocked(options)
+	return task, err
+}
+
+// claimNextLocked 要求调用方已经持有 s.mu 的写锁。
+func (s *MemoryTaskStore) claimNextLocked(
+	options ClaimOptions,
+) (*domain.Task, *domain.Task, domain.ClaimKind, error) {
 	var selected *domain.Task
-	recovering := false
+	claimKind := domain.ClaimInitial
 	for _, task := range s.tasks {
 		if task.Status != domain.TaskStatusRunning ||
 			task.LeaseExpiresAt == nil ||
@@ -104,31 +112,42 @@ func (s *MemoryTaskStore) ClaimNext(ctx context.Context, options ClaimOptions) (
 			task.LeaseExpiresAt.Before(*selected.LeaseExpiresAt) ||
 			(task.LeaseExpiresAt.Equal(*selected.LeaseExpiresAt) && task.ID < selected.ID) {
 			selected = task
-			recovering = true
+			claimKind = domain.ClaimRecovery
 		}
 	}
 
 	if selected == nil {
 		for _, task := range s.tasks {
-			if task.Status != domain.TaskStatusQueued {
+			if (task.Status != domain.TaskStatusQueued && task.Status != domain.TaskStatusRetrying) ||
+				task.AvailableAt.After(options.Now) {
 				continue
 			}
-			//1.还没选过任务 2.最早创建的 queued 任务 3. 创建时间一样，用ID 最小的 queued 任务
-			if selected == nil || task.CreatedAt.Before(selected.CreatedAt) ||
-				(task.CreatedAt.Equal(selected.CreatedAt) && task.ID < selected.ID) {
+			// 与 MySQL 的 ORDER BY available_at, created_at, id 保持一致。
+			if selected == nil ||
+				task.AvailableAt.Before(selected.AvailableAt) ||
+				(task.AvailableAt.Equal(selected.AvailableAt) && task.CreatedAt.Before(selected.CreatedAt)) ||
+				(task.AvailableAt.Equal(selected.AvailableAt) &&
+					task.CreatedAt.Equal(selected.CreatedAt) &&
+					task.ID < selected.ID) {
 				selected = task
+				if task.Status == domain.TaskStatusRetrying {
+					claimKind = domain.ClaimRetry
+				} else {
+					claimKind = domain.ClaimInitial
+				}
 			}
 		}
 	}
 	if selected == nil {
-		return nil, ErrNoTaskAvailable
+		return nil, nil, "", ErrNoTaskAvailable
 	}
-	if recovering {
+	previous := cloneTask(selected)
+	if claimKind == domain.ClaimRecovery {
 		selected.RetryCount++
 		selected.UpdatedAt = options.Now
 	} else {
 		if err := selected.MoveTo(domain.TaskStatusRunning, options.Now); err != nil {
-			return nil, err
+			return nil, nil, "", err
 		}
 	}
 	leaseExpiresAt := options.Now.Add(options.LeaseDuration)
@@ -136,7 +155,7 @@ func (s *MemoryTaskStore) ClaimNext(ctx context.Context, options ClaimOptions) (
 	selected.LeaseExpiresAt = &leaseExpiresAt
 	selected.Version++
 
-	return cloneTask(selected), nil
+	return cloneTask(selected), previous, claimKind, nil
 }
 
 func (s *MemoryTaskStore) RenewLease(ctx context.Context, options RenewLeaseOptions) error {
@@ -176,6 +195,12 @@ func (s *MemoryTaskStore) FailNextExpired(ctx context.Context, now time.Time) (*
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	task, _, err := s.failNextExpiredLocked(now)
+	return task, err
+}
+
+// failNextExpiredLocked 要求调用方已经持有 s.mu 的写锁。
+func (s *MemoryTaskStore) failNextExpiredLocked(now time.Time) (*domain.Task, *domain.Task, error) {
 	var selected *domain.Task
 	for _, task := range s.tasks {
 		if task.Status != domain.TaskStatusRunning ||
@@ -191,15 +216,16 @@ func (s *MemoryTaskStore) FailNextExpired(ctx context.Context, now time.Time) (*
 		}
 	}
 	if selected == nil {
-		return nil, ErrNoExpiredTask
+		return nil, nil, ErrNoExpiredTask
 	}
 
+	previous := cloneTask(selected)
 	selected.ErrorMessage = "task lease expired and retry budget exhausted"
 	if err := selected.MoveTo(domain.TaskStatusFailed, now); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	selected.Version++
-	return cloneTask(selected), nil
+	return cloneTask(selected), previous, nil
 }
 
 func cloneTask(task *domain.Task) *domain.Task {
