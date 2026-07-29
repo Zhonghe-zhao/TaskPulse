@@ -97,6 +97,18 @@ go run ./cmd/taskpulse
 
 MySQL 连接失败时应用直接退出，不会静默退回内存存储。
 
+## 当前 HTTP API
+
+```text
+POST /tasks
+GET  /tasks/{task_id}
+GET  /tasks/{task_id}/events
+POST /tasks/{task_id}/cancel
+```
+
+取消接口当前只接受 `queued` 和 `retrying` 任务。重复取消是幂等操作；`running` 任务返回
+`409 Conflict`，因为运行中 Executor 的协作式停止尚未实现。
+
 ## 开发演进路线
 
 ```text

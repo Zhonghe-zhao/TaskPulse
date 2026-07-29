@@ -1,7 +1,7 @@
 # TaskPulse MVP 路线图
 
 - 文档状态：执行中
-- 最近更新：2026-07-23
+- 最近更新：2026-07-29
 - 当前里程碑：MySQL 持久化
 
 ## MVP 目标
@@ -40,13 +40,13 @@
 - [x] 在同一事务中提交 Worker 任务终态与终态事件
 - [x] 在同一事务中领取任务并写入 started/recovered Event
 - [x] 在同一事务中清理过期任务并写入 failed Event
-- [ ] 使用唯一 `idempotency_key` 防止重复创建
+- [x] 使用唯一 `idempotency_key` 防止重复创建
 - [x] 使用 `FOR UPDATE SKIP LOCKED` 领取任务
 - [ ] 增加数据库集成测试
 - [ ] 实验：重启服务后任务仍可查询
 - [ ] 实验：多个 Worker 只能领取一次任务
 
-决策依据：[ADR-0001](adr/0001-use-mysql-as-system-of-record.md)
+决策依据：[ADR-0001](adr/0001-use-mysql-as-system-of-record.md)、[ADR-0007](adr/0007-idempotent-task-creation.md)
 
 ## 里程碑二：可靠执行
 
@@ -63,8 +63,8 @@
 - [x] Worker 根据临时错误/永久错误分类选择重试或失败
 - [x] 指数退避和最大重试次数
 - [ ] 死信终态
-- [ ] 取消任务 API
-- [ ] Context 协作式取消
+- [x] 取消 queued/retrying 任务 API，并原子写入 canceled Event（ADR-0008）
+- [ ] 运行中任务的取消请求与 Context 协作式取消
 - [x] 条件更新和版本号防止并发状态覆盖
 - [ ] 实验：杀死 Worker 后任务恢复
 - [ ] 实验：重复执行不产生错误终态
