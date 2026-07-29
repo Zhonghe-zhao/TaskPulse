@@ -1,8 +1,8 @@
 # TaskPulse 系统架构
 
 - 文档状态：当前架构说明
-- 最近更新：2026-07-28
-- 相关决策：[ADR-0001：使用 MySQL 8](adr/0001-use-mysql-as-system-of-record.md)、[ADR-0002：原子创建任务与初始事件](adr/0002-atomic-task-and-created-event.md)
+- 最近更新：2026-07-29
+- 相关决策：[ADR-0001：使用 MySQL 8](adr/0001-use-mysql-as-system-of-record.md)、[ADR-0002：原子创建任务与初始事件](adr/0002-atomic-task-and-created-event.md)、[ADR-0003：原子提交任务终态与终态事件](adr/0003-atomic-terminal-task-transition.md)、[ADR-0004：原子提交任务领取与领取事件](adr/0004-atomic-task-claim-event.md)、[ADR-0005：原子提交过期任务失败与失败事件](adr/0005-atomic-expired-task-failure.md)、[ADR-0006：通用错误分类与重试语义](adr/0006-generic-retry-semantics.md)
 
 ## 架构目标
 
@@ -28,7 +28,7 @@ MySQL TaskCreationStore
   ▼
 MySQL 8（Task/Event 真相源与任务队列）
   ▲
-  │ ClaimNext / RenewLease / Update / FailNextExpired
+  │ ClaimNextWithEvent / RenewLease / UpdateTaskWithEvent / FailNextExpiredWithEvent
   │
 worker.Worker + Reaper
   │
@@ -88,8 +88,15 @@ store implementations → domain
 - Memory Store 的并发保护和数据深复制。
 - MySQL 持久化 Task 与 TaskEvent。
 - Task 与 Created Event 的事务原子创建。
+- Worker 终态更新与 succeeded/partial/failed Event 的事务原子提交。
+- Worker 领取/恢复任务与 started/recovered Event 的事务原子提交。
+- Reaper 失败清理与 failed Event 的事务原子提交。
 - `FOR UPDATE SKIP LOCKED` 并发领取。
 - Worker 租约、心跳续租、过期接管和版本隔离。
+- Memory/MySQL Store 统一按照 `available_at` 控制任务可领取时间。
+- 领取路径通过 `ClaimKind` 区分 initial、retry 和 recovery，避免根据重试次数猜测来源。
+- Worker 仅对明确分类的 transient 错误应用 workflow 重试策略，普通错误和永久错误直接失败。
+- 重试等待、重新领取和生命周期事件均持久化，可跨进程重启继续调度。
 - 重试额度耗尽后的 Reaper 失败清理。
 - Worker 根据 workflow 选择 Executor。
 - URL 检测的有界并发、结果顺序保持和部分成功语义。
@@ -98,8 +105,7 @@ store implementations → domain
 
 ## 当前明确不具备的保证
 
-- Worker 状态更新与运行事件尚未在同一事务提交。
-- 幂等创建、按错误类型自动重试、人工死信重放和任务取消尚未完成。
+- 幂等创建、人工死信重放和任务取消尚未完成。
 - 实时事件推送尚未完成。
 - SSRF 防护；当前 URL Executor 不能直接暴露到公网。
 - Redis、Prometheus 或 Kubernetes 运行能力。
@@ -147,7 +153,7 @@ task_events
 
 只有当 URL 需要独立领取、独立重试和独立查询时，再通过新 ADR 引入 `task_items`，不能因为旧设计文档出现过该表就直接实现。
 
-## 下一阶段关键事务
+## 当前关键事务
 
 ### 创建任务
 
@@ -170,7 +176,21 @@ BEGIN
 → COMMIT
 ```
 
-目标：多个进程竞争时只有一个 Worker 获得该任务，同时为崩溃恢复留下租约信息。
+当前保证：多个进程竞争时只有一个 Worker 获得该任务，任务领取和 started/recovered
+事件在同一事务提交，同时为崩溃恢复留下租约信息。
+
+### 清理重试耗尽的过期任务
+
+```text
+BEGIN
+→ SELECT expired running task FOR UPDATE SKIP LOCKED
+→ UPDATE status=failed, clear lease, version=version+1
+→ INSERT task_failed event
+→ COMMIT
+```
+
+当前保证：任务失败状态和失败事件同时提交；事件写入失败时，任务仍保持清理前状态，
+可由 Reaper 在后续轮询中再次处理。
 
 ## 后续演进条件
 

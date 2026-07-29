@@ -37,6 +37,9 @@
 - [x] 实现 MySQLEventStore.Append/ListByTaskID
 - [x] 在同一事务中创建 Task 和 Created Event
 - [x] 将 MySQL Store 接入 API、Worker 与 Reaper 运行链路
+- [x] 在同一事务中提交 Worker 任务终态与终态事件
+- [x] 在同一事务中领取任务并写入 started/recovered Event
+- [x] 在同一事务中清理过期任务并写入 failed Event
 - [ ] 使用唯一 `idempotency_key` 防止重复创建
 - [x] 使用 `FOR UPDATE SKIP LOCKED` 领取任务
 - [ ] 增加数据库集成测试
@@ -51,12 +54,18 @@
 
 - [x] Worker 租约、心跳续租与过期重新领取
 - [x] 重试额度耗尽后的过期任务清理
-- [ ] 临时错误/永久错误分类
-- [ ] 指数退避和最大重试次数
+- [x] 明确通用错误分类、重试预算与退避语义（ADR-0006）
+- [x] 实现 ExecutionError、RetryPolicy 与可测试的 equal-jitter 退避计算
+- [x] 将 available_at 纳入领域模型，定义 ScheduleRetry，并统一 Memory/MySQL 延迟领取语义
+- [x] 原子保存 running → retrying 与 task_retrying Event
+- [x] 使用 ClaimKind 区分首次领取、错误重试与租约恢复
+- [x] 到期的 retrying 任务可被原子领取并写入 task_retry_started
+- [x] Worker 根据临时错误/永久错误分类选择重试或失败
+- [x] 指数退避和最大重试次数
 - [ ] 死信终态
 - [ ] 取消任务 API
 - [ ] Context 协作式取消
-- [ ] 条件更新或版本号防止并发状态覆盖
+- [x] 条件更新和版本号防止并发状态覆盖
 - [ ] 实验：杀死 Worker 后任务恢复
 - [ ] 实验：重复执行不产生错误终态
 
