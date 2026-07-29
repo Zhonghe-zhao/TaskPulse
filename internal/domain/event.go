@@ -111,6 +111,25 @@ func NewTaskExpiredEvent(id string, task *Task, now time.Time) (*TaskEvent, erro
 	)
 }
 
+func NewTaskCanceledEvent(id string, task *Task, now time.Time) (*TaskEvent, error) {
+	if task == nil {
+		return nil, errors.New("task is nil")
+	}
+	if task.Status != TaskStatusCanceled {
+		return nil, errors.New("task is not canceled")
+	}
+
+	return NewTaskEvent(
+		id,
+		task.ID,
+		EventTaskCanceled,
+		"task canceled",
+		json.RawMessage(`{"reason":"requested_by_caller"}`),
+		task.Progress,
+		now,
+	)
+}
+
 func NewTaskRetryingEvent(
 	id string,
 	task *Task,

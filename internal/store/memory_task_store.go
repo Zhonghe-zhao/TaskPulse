@@ -10,13 +10,15 @@ import (
 )
 
 type MemoryTaskStore struct {
-	mu    sync.RWMutex
-	tasks map[string]*domain.Task
+	mu                      sync.RWMutex
+	tasks                   map[string]*domain.Task
+	taskIDsByIdempotencyKey map[string]string
 }
 
 func NewMemoryTaskStore() *MemoryTaskStore {
 	return &MemoryTaskStore{
-		tasks: make(map[string]*domain.Task),
+		tasks:                   make(map[string]*domain.Task),
+		taskIDsByIdempotencyKey: make(map[string]string),
 	}
 }
 
@@ -34,8 +36,16 @@ func (s *MemoryTaskStore) Create(ctx context.Context, task *domain.Task) error {
 	if _, exists := s.tasks[task.ID]; exists {
 		return ErrTaskAlreadyExists
 	}
+	if task.IdempotencyKey != "" {
+		if _, exists := s.taskIDsByIdempotencyKey[task.IdempotencyKey]; exists {
+			return ErrIdempotencyConflict
+		}
+	}
 
 	s.tasks[task.ID] = cloneTask(task)
+	if task.IdempotencyKey != "" {
+		s.taskIDsByIdempotencyKey[task.IdempotencyKey] = task.ID
+	}
 	return nil
 }
 
@@ -71,6 +81,9 @@ func (s *MemoryTaskStore) Update(ctx context.Context, task *domain.Task) error {
 		return ErrTaskNotFound
 	}
 	if stored.Version != task.Version {
+		return ErrTaskConflict
+	}
+	if stored.IdempotencyKey != task.IdempotencyKey {
 		return ErrTaskConflict
 	}
 

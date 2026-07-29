@@ -30,18 +30,34 @@ func (h *Handler) CreateTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	task, err := h.taskService.CreateTask(r.Context(), application.CreateTaskInput{
-		Workflow: request.Workflow, Input: request.Input, MaxRetries: request.MaxRetries,
+	result, err := h.taskService.CreateTask(r.Context(), application.CreateTaskInput{
+		IdempotencyKey: r.Header.Get("Idempotency-Key"),
+		Workflow:       request.Workflow,
+		Input:          request.Input,
+		MaxRetries:     request.MaxRetries,
 	})
 	if err != nil {
 		writeApplicationError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, task)
+	status := http.StatusOK
+	if result.Created {
+		status = http.StatusCreated
+	}
+	writeJSON(w, status, result.Task)
 }
 
 func (h *Handler) GetTask(w http.ResponseWriter, r *http.Request) {
 	task, err := h.taskService.GetTask(r.Context(), r.PathValue("task_id"))
+	if err != nil {
+		writeApplicationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, task)
+}
+
+func (h *Handler) CancelTask(w http.ResponseWriter, r *http.Request) {
+	task, err := h.taskService.CancelTask(r.Context(), r.PathValue("task_id"))
 	if err != nil {
 		writeApplicationError(w, err)
 		return
@@ -78,6 +94,10 @@ func writeApplicationError(w http.ResponseWriter, err error) {
 	case errors.Is(err, store.ErrTaskNotFound):
 		writeError(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, store.ErrTaskAlreadyExists):
+		writeError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, store.ErrIdempotencyConflict):
+		writeError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, store.ErrTaskNotCancelable):
 		writeError(w, http.StatusConflict, err.Error())
 	default:
 		writeError(w, http.StatusInternalServerError, "internal server error")

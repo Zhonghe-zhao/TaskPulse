@@ -31,7 +31,12 @@ func main() {
 	}()
 	log.Printf("TaskPulse storage backend: %s", backend)
 
-	taskService := application.NewTaskService(stores.tasks, stores.events, stores.taskCreation)
+	taskService := application.NewTaskService(
+		stores.tasks,
+		stores.events,
+		stores.taskCreation,
+		stores.taskTransition,
+	)
 	router := httptransport.NewRouter(httptransport.NewHandler(taskService))
 
 	urlCheckExecutor := urlcheck.NewWithConcurrency(

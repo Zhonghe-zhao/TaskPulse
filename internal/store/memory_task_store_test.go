@@ -119,6 +119,25 @@ func TestMemoryTaskStoreRejectsStaleUpdate(t *testing.T) {
 	}
 }
 
+func TestMemoryTaskStoreRejectsIdempotencyKeyChange(t *testing.T) {
+	ctx := context.Background()
+	taskStore := NewMemoryTaskStore()
+	task := newTestTask(t, "task_1")
+	task.IdempotencyKey = "request-1"
+	if err := taskStore.Create(ctx, task); err != nil {
+		t.Fatalf("Create returned error: %v", err)
+	}
+
+	stored, err := taskStore.Get(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("Get returned error: %v", err)
+	}
+	stored.IdempotencyKey = "request-2"
+	if err := taskStore.Update(ctx, stored); !errors.Is(err, ErrTaskConflict) {
+		t.Fatalf("expected ErrTaskConflict, got %v", err)
+	}
+}
+
 func TestMemoryTaskStoreRejectsUpdateForMissingTask(t *testing.T) {
 	ctx := context.Background()
 	store := NewMemoryTaskStore()

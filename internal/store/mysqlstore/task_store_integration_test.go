@@ -52,6 +52,7 @@ func TestMySQLTaskStoreCreateAndGetIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewTask returned error: %v", err)
 	}
+	task.IdempotencyKey = fmt.Sprintf("idem_mysql_%d", time.Now().UnixNano())
 	if err := taskStore.Create(ctx, task); err != nil {
 		t.Fatalf("Create returned error: %v", err)
 	}
@@ -62,6 +63,9 @@ func TestMySQLTaskStoreCreateAndGetIntegration(t *testing.T) {
 	}
 	if got.ID != task.ID || got.Workflow != task.Workflow || got.Status != task.Status {
 		t.Fatalf("unexpected stored task: %+v", got)
+	}
+	if got.IdempotencyKey != task.IdempotencyKey {
+		t.Fatalf("expected idempotency key %q, got %q", task.IdempotencyKey, got.IdempotencyKey)
 	}
 	if !jsonEqual(got.Input, task.Input) {
 		t.Fatalf("expected input %s, got %s", task.Input, got.Input)
@@ -75,6 +79,11 @@ func TestMySQLTaskStoreCreateAndGetIntegration(t *testing.T) {
 			got.CreatedAt,
 			got.UpdatedAt,
 		)
+	}
+	changedKey := *got
+	changedKey.IdempotencyKey = "different-key"
+	if err := taskStore.Update(ctx, &changedKey); !errors.Is(err, storeerrors.ErrTaskConflict) {
+		t.Fatalf("expected ErrTaskConflict for changed idempotency key, got %v", err)
 	}
 	stale := *got
 	startedAt := now.Add(time.Second)
@@ -159,6 +168,9 @@ func TestMySQLTaskStoreClaimsTaskOnlyOnceIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewTaskStore returned error: %v", err)
 	}
+	if err := cleanupActiveTasks(ctx, db); err != nil {
+		t.Fatalf("cleanupActiveTasks returned error: %v", err)
+	}
 	taskID := fmt.Sprintf("task_mysql_claim_%d", time.Now().UnixNano())
 	t.Cleanup(func() {
 		_, _ = db.ExecContext(context.Background(), "DELETE FROM tasks WHERE id = ?", taskID)
@@ -178,20 +190,6 @@ func TestMySQLTaskStoreClaimsTaskOnlyOnceIntegration(t *testing.T) {
 	if err := taskStore.Create(ctx, task); err != nil {
 		t.Fatalf("Create returned error: %v", err)
 	}
-	// Remove leftover claimable rows from earlier failed runs so ClaimNext only sees this task.
-	_, _ = db.ExecContext(ctx, `
-		DELETE FROM tasks
-		WHERE id <> ?
-		  AND (
-		    (status = ? AND available_at <= ?)
-		    OR (status = ? AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
-		  )`,
-		taskID,
-		string(domain.TaskStatusQueued),
-		createdAt.Add(time.Second),
-		string(domain.TaskStatusRunning),
-		createdAt.Add(time.Second),
-	)
 
 	const claimers = 8
 	type claimResult struct {

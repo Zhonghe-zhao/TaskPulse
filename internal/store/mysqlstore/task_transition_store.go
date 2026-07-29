@@ -46,6 +46,14 @@ func (s *MySQLTaskTransitionStore) ClaimNextWithEvent(
 		}
 	}()
 
+	exists, err := eventExists(ctx, tx, eventID)
+	if err != nil {
+		return nil, fmt.Errorf("check claim event %q: %w", eventID, err)
+	}
+	if exists {
+		return nil, storeerrors.ErrEventAlreadyExists
+	}
+
 	task, claimKind, err := claimNextInTx(ctx, tx, options)
 	if err != nil {
 		return nil, err
@@ -85,6 +93,14 @@ func (s *MySQLTaskTransitionStore) FailNextExpiredWithEvent(
 		}
 	}()
 
+	exists, err := eventExists(ctx, tx, eventID)
+	if err != nil {
+		return nil, fmt.Errorf("check expired task event %q: %w", eventID, err)
+	}
+	if exists {
+		return nil, storeerrors.ErrEventAlreadyExists
+	}
+
 	task, err := failNextExpiredInTx(ctx, tx, now)
 	if err != nil {
 		return nil, err
@@ -117,7 +133,7 @@ func (s *MySQLTaskTransitionStore) UpdateTaskWithEvent(
 		return storeerrors.ErrTaskEventMismatch
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return fmt.Errorf("begin task transition transaction: %w", err)
 	}
@@ -126,6 +142,14 @@ func (s *MySQLTaskTransitionStore) UpdateTaskWithEvent(
 			_ = tx.Rollback()
 		}
 	}()
+
+	exists, err := eventExists(ctx, tx, event.ID)
+	if err != nil {
+		return fmt.Errorf("check transition event %q: %w", event.ID, err)
+	}
+	if exists {
+		return storeerrors.ErrEventAlreadyExists
+	}
 
 	if err = updateTask(ctx, tx, task); err != nil {
 		return err

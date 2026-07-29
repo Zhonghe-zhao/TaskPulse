@@ -16,11 +16,16 @@ const (
 	storageBackendMySQL  = "mysql"
 )
 
+type taskRuntimeStore interface {
+	store.TaskTransitionStore
+	store.TaskCancellationStore
+}
+
 type runtimeStores struct {
 	tasks          store.TaskStore
 	events         store.EventStore
 	taskCreation   store.TaskCreationStore
-	taskTransition store.TaskTransitionStore
+	taskTransition taskRuntimeStore
 	close          func() error
 }
 

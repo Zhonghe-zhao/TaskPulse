@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -48,19 +50,26 @@ func TestMySQLTaskCreationStoreCommitsTaskAndEventIntegration(t *testing.T) {
 	taskID := fmt.Sprintf("task_atomic_%d", suffix)
 	eventID := fmt.Sprintf("event_atomic_%d", suffix)
 	rollbackTaskID := fmt.Sprintf("task_atomic_rollback_%d", suffix)
+	caseVariantTaskID := fmt.Sprintf("task_atomic_case_variant_%d", suffix)
 	t.Cleanup(func() {
 		_, _ = db.ExecContext(
 			context.Background(),
-			"DELETE FROM tasks WHERE id IN (?, ?)",
+			"DELETE FROM tasks WHERE id IN (?, ?, ?)",
 			taskID,
 			rollbackTaskID,
+			caseVariantTaskID,
 		)
 	})
 
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	task, event := newMySQLTaskCreationPair(t, taskID, eventID, now)
-	if err := creator.CreateTaskWithEvent(ctx, task, event); err != nil {
+	task.IdempotencyKey = fmt.Sprintf("idem_atomic_%d", suffix)
+	result, err := creator.CreateTaskWithEvent(ctx, task, event)
+	if err != nil {
 		t.Fatalf("CreateTaskWithEvent returned error: %v", err)
+	}
+	if !result.Created {
+		t.Fatal("expected first request to create task")
 	}
 	if _, err := taskStore.Get(ctx, taskID); err != nil {
 		t.Fatalf("Get committed task returned error: %v", err)
@@ -73,17 +82,160 @@ func TestMySQLTaskCreationStoreCommitsTaskAndEventIntegration(t *testing.T) {
 		t.Fatalf("unexpected committed events: %+v", events)
 	}
 
+	replayTask, replayEvent := newMySQLTaskCreationPair(
+		t,
+		fmt.Sprintf("task_atomic_replay_%d", suffix),
+		fmt.Sprintf("event_atomic_replay_%d", suffix),
+		now.Add(time.Second),
+	)
+	replayTask.IdempotencyKey = task.IdempotencyKey
+	replayed, err := creator.CreateTaskWithEvent(ctx, replayTask, replayEvent)
+	if err != nil {
+		t.Fatalf("replayed CreateTaskWithEvent returned error: %v", err)
+	}
+	if replayed.Created || replayed.Task.ID != task.ID {
+		t.Fatalf("unexpected replay result: %+v", replayed)
+	}
+
+	conflictTask, conflictEvent := newMySQLTaskCreationPair(
+		t,
+		fmt.Sprintf("task_atomic_conflict_%d", suffix),
+		fmt.Sprintf("event_atomic_conflict_%d", suffix),
+		now.Add(2*time.Second),
+	)
+	conflictTask.IdempotencyKey = task.IdempotencyKey
+	conflictTask.Workflow = "different_workflow"
+	if _, err := creator.CreateTaskWithEvent(ctx, conflictTask, conflictEvent); !errors.Is(err, storeerrors.ErrIdempotencyConflict) {
+		t.Fatalf("expected ErrIdempotencyConflict, got %v", err)
+	}
+	events, err = eventStore.ListByTaskID(ctx, taskID)
+	if err != nil {
+		t.Fatalf("ListByTaskID after replay returned error: %v", err)
+	}
+	if len(events) != 1 || events[0].ID != eventID {
+		t.Fatalf("replay or conflict created additional events: %+v", events)
+	}
+
+	caseVariantTask, caseVariantEvent := newMySQLTaskCreationPair(
+		t,
+		caseVariantTaskID,
+		fmt.Sprintf("event_atomic_case_variant_%d", suffix),
+		now.Add(3*time.Second),
+	)
+	caseVariantTask.IdempotencyKey = strings.ToUpper(task.IdempotencyKey)
+	caseVariantResult, err := creator.CreateTaskWithEvent(ctx, caseVariantTask, caseVariantEvent)
+	if err != nil {
+		t.Fatalf("case-variant CreateTaskWithEvent returned error: %v", err)
+	}
+	if !caseVariantResult.Created || caseVariantResult.Task.ID != caseVariantTaskID {
+		t.Fatalf("case-distinct idempotency key did not create a new task: %+v", caseVariantResult)
+	}
+
 	rollbackTask, rollbackEvent := newMySQLTaskCreationPair(
 		t,
 		rollbackTaskID,
 		eventID,
 		now.Add(time.Second),
 	)
-	if err := creator.CreateTaskWithEvent(ctx, rollbackTask, rollbackEvent); !errors.Is(err, storeerrors.ErrEventAlreadyExists) {
+	if _, err := creator.CreateTaskWithEvent(ctx, rollbackTask, rollbackEvent); !errors.Is(err, storeerrors.ErrEventAlreadyExists) {
 		t.Fatalf("expected ErrEventAlreadyExists, got %v", err)
 	}
 	if _, err := taskStore.Get(ctx, rollbackTaskID); !errors.Is(err, storeerrors.ErrTaskNotFound) {
 		t.Fatalf("task insert was not rolled back: %v", err)
+	}
+}
+
+func TestMySQLTaskCreationStoreCreatesIdempotentTaskOnceConcurrentlyIntegration(t *testing.T) {
+	if os.Getenv("TASKPULSE_MYSQL_INTEGRATION") != "1" {
+		t.Skip("set TASKPULSE_MYSQL_INTEGRATION=1 to run MySQL store integration tests")
+	}
+
+	config, err := platformdb.MySQLConfigFromEnv()
+	if err != nil {
+		t.Fatalf("MySQLConfigFromEnv returned error: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	db, err := platformdb.OpenMySQL(ctx, config)
+	if err != nil {
+		t.Fatalf("OpenMySQL returned error: %v", err)
+	}
+	defer db.Close()
+
+	creator, err := NewTaskCreationStore(db)
+	if err != nil {
+		t.Fatalf("NewTaskCreationStore returned error: %v", err)
+	}
+	eventStore, err := NewEventStore(db)
+	if err != nil {
+		t.Fatalf("NewEventStore returned error: %v", err)
+	}
+
+	suffix := time.Now().UnixNano()
+	idempotencyKey := fmt.Sprintf("idem_concurrent_%d", suffix)
+	t.Cleanup(func() {
+		_, _ = db.ExecContext(
+			context.Background(),
+			"DELETE FROM tasks WHERE idempotency_key = ?",
+			idempotencyKey,
+		)
+	})
+
+	const requests = 8
+	tasks := make([]*domain.Task, requests)
+	events := make([]*domain.TaskEvent, requests)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	for index := 0; index < requests; index++ {
+		tasks[index], events[index] = newMySQLTaskCreationPair(
+			t,
+			fmt.Sprintf("task_idem_%d_%d", suffix, index),
+			fmt.Sprintf("event_idem_%d_%d", suffix, index),
+			now,
+		)
+		tasks[index].IdempotencyKey = idempotencyKey
+	}
+
+	type outcome struct {
+		result *storeerrors.TaskCreationResult
+		err    error
+	}
+	outcomes := make(chan outcome, requests)
+	var waitGroup sync.WaitGroup
+	for index := 0; index < requests; index++ {
+		waitGroup.Add(1)
+		go func(index int) {
+			defer waitGroup.Done()
+			result, createErr := creator.CreateTaskWithEvent(ctx, tasks[index], events[index])
+			outcomes <- outcome{result: result, err: createErr}
+		}(index)
+	}
+	waitGroup.Wait()
+	close(outcomes)
+
+	created := 0
+	var taskID string
+	for outcome := range outcomes {
+		if outcome.err != nil {
+			t.Fatalf("CreateTaskWithEvent returned error: %v", outcome.err)
+		}
+		if outcome.result.Created {
+			created++
+		}
+		if taskID == "" {
+			taskID = outcome.result.Task.ID
+		} else if outcome.result.Task.ID != taskID {
+			t.Fatalf("expected every request to return task %s, got %s", taskID, outcome.result.Task.ID)
+		}
+	}
+	if created != 1 {
+		t.Fatalf("expected exactly one creation, got %d", created)
+	}
+	storedEvents, err := eventStore.ListByTaskID(ctx, taskID)
+	if err != nil {
+		t.Fatalf("ListByTaskID returned error: %v", err)
+	}
+	if len(storedEvents) != 1 || storedEvents[0].Type != domain.EventTaskCreated {
+		t.Fatalf("unexpected events after concurrent creation: %+v", storedEvents)
 	}
 }
 

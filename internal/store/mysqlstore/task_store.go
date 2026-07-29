@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	mysqldriver "github.com/go-sql-driver/mysql"
@@ -17,6 +18,7 @@ import (
 const insertTaskQuery = `
 INSERT INTO tasks (
     id,
+    idempotency_key,
     workflow,
     status,
     input_json,
@@ -30,11 +32,12 @@ INSERT INTO tasks (
     updated_at,
     started_at,
     finished_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 const getTaskQuery = `
 SELECT
     id,
+    idempotency_key,
     workflow,
     status,
     input_json,
@@ -54,9 +57,33 @@ SELECT
 FROM tasks
 WHERE id = ?`
 
+const getTaskByIdempotencyKeyQuery = `
+SELECT
+    id,
+    idempotency_key,
+    workflow,
+    status,
+    input_json,
+    result_json,
+    error_message,
+    progress,
+    retry_count,
+    max_retries,
+    available_at,
+    lease_owner,
+    lease_expires_at,
+    version,
+    created_at,
+    updated_at,
+    started_at,
+    finished_at
+FROM tasks
+WHERE idempotency_key = ?`
+
 const claimNextTaskQuery = `
 SELECT
     id,
+    idempotency_key,
     workflow,
     status,
     input_json,
@@ -83,6 +110,7 @@ FOR UPDATE SKIP LOCKED` //它解决多个 Worker 并发领取的问题。
 const claimExpiredTaskQuery = `
 SELECT
     id,
+    idempotency_key,
     workflow,
     status,
     input_json,
@@ -124,7 +152,8 @@ SET
     finished_at = ?,
     version = version + 1
 WHERE id = ?
-  AND version = ?`
+  AND version = ?
+  AND idempotency_key <=> ?`
 
 const renewLeaseQuery = `
 UPDATE tasks
@@ -139,6 +168,7 @@ WHERE id = ?
 const selectExpiredExhaustedTaskQuery = `
 SELECT
     id,
+    idempotency_key,
     workflow,
     status,
     input_json,
@@ -189,6 +219,7 @@ func insertTask(ctx context.Context, executor sqlExecutor, task *domain.Task) er
 		ctx,
 		insertTaskQuery,
 		task.ID,
+		nullableString(task.IdempotencyKey),
 		task.Workflow,
 		string(task.Status),
 		[]byte(task.Input),
@@ -206,6 +237,9 @@ func insertTask(ctx context.Context, executor sqlExecutor, task *domain.Task) er
 	if err != nil {
 		var mysqlError *mysqldriver.MySQLError
 		if errors.As(err, &mysqlError) && mysqlError.Number == 1062 {
+			if strings.Contains(mysqlError.Message, "uk_tasks_idempotency_key") {
+				return storeerrors.ErrIdempotencyKeyAlreadyExists
+			}
 			return storeerrors.ErrTaskAlreadyExists
 		}
 		return fmt.Errorf("insert task %q: %w", task.ID, err)
@@ -220,6 +254,24 @@ func (s *MySQLTaskStore) Get(ctx context.Context, id string) (*domain.Task, erro
 	}
 	if err != nil {
 		return nil, fmt.Errorf("select task %q: %w", id, err)
+	}
+	return task, nil
+}
+
+func (s *MySQLTaskStore) getByIdempotencyKey(
+	ctx context.Context,
+	idempotencyKey string,
+) (*domain.Task, error) {
+	task, err := scanTask(s.db.QueryRowContext(
+		ctx,
+		getTaskByIdempotencyKeyQuery,
+		idempotencyKey,
+	))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, storeerrors.ErrTaskNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("select task by idempotency key: %w", err)
 	}
 	return task, nil
 }
@@ -336,6 +388,7 @@ type rowScanner interface {
 
 func scanTask(row rowScanner) (*domain.Task, error) {
 	var task domain.Task
+	var idempotencyKey sql.NullString
 	var status string
 	var inputJSON []byte
 	var resultJSON []byte
@@ -347,6 +400,7 @@ func scanTask(row rowScanner) (*domain.Task, error) {
 
 	err := row.Scan(
 		&task.ID,
+		&idempotencyKey,
 		&task.Workflow,
 		&status,
 		&inputJSON,
@@ -369,6 +423,9 @@ func scanTask(row rowScanner) (*domain.Task, error) {
 	}
 
 	task.Status = domain.TaskStatus(status)
+	if idempotencyKey.Valid {
+		task.IdempotencyKey = idempotencyKey.String
+	}
 	task.Input = cloneJSON(inputJSON)
 	task.Result = cloneJSON(resultJSON)
 	if errorMessage.Valid {
@@ -412,6 +469,7 @@ func updateTask(ctx context.Context, executor sqlQueryExecutor, task *domain.Tas
 		nullableTime(task.FinishedAt),
 		task.ID,
 		task.Version,
+		nullableString(task.IdempotencyKey),
 	)
 	if err != nil {
 		return fmt.Errorf("update task %q at version %d: %w", task.ID, task.Version, err)

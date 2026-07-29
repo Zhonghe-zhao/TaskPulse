@@ -32,6 +32,7 @@ var (
 
 type Task struct {
 	ID             string          `json:"id"`
+	IdempotencyKey string          `json:"idempotency_key,omitempty"`
 	Workflow       string          `json:"workflow"`
 	Status         TaskStatus      `json:"status"`
 	Input          json.RawMessage `json:"input"`

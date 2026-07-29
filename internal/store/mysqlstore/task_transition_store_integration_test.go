@@ -47,6 +47,9 @@ func TestMySQLTaskTransitionStoreCommitsTaskAndEventIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewTaskTransitionStore returned error: %v", err)
 	}
+	if err := cleanupActiveTasks(ctx, db); err != nil {
+		t.Fatalf("cleanupActiveTasks returned error: %v", err)
+	}
 
 	suffix := time.Now().UnixNano()
 	taskID := fmt.Sprintf("task_transition_%d", suffix)
@@ -61,7 +64,7 @@ func TestMySQLTaskTransitionStoreCommitsTaskAndEventIntegration(t *testing.T) {
 		fmt.Sprintf("event_created_%d", suffix),
 		createdAt,
 	)
-	if err := creationStore.CreateTaskWithEvent(ctx, task, createdEvent); err != nil {
+	if _, err := creationStore.CreateTaskWithEvent(ctx, task, createdEvent); err != nil {
 		t.Fatalf("CreateTaskWithEvent returned error: %v", err)
 	}
 	running, err := taskStore.ClaimNext(ctx, storeerrors.ClaimOptions{
@@ -181,6 +184,9 @@ func TestMySQLTaskTransitionStoreClaimsTaskAndEventAtomicallyIntegration(t *test
 	if err != nil {
 		t.Fatalf("NewTaskTransitionStore returned error: %v", err)
 	}
+	if err := cleanupActiveTasks(ctx, db); err != nil {
+		t.Fatalf("cleanupActiveTasks returned error: %v", err)
+	}
 
 	suffix := time.Now().UnixNano()
 	taskID := fmt.Sprintf("task_claim_transition_%d", suffix)
@@ -195,7 +201,7 @@ func TestMySQLTaskTransitionStoreClaimsTaskAndEventAtomicallyIntegration(t *test
 		fmt.Sprintf("event_created_%d", suffix),
 		createdAt,
 	)
-	if err := creationStore.CreateTaskWithEvent(ctx, task, createdEvent); err != nil {
+	if _, err := creationStore.CreateTaskWithEvent(ctx, task, createdEvent); err != nil {
 		t.Fatalf("CreateTaskWithEvent returned error: %v", err)
 	}
 
@@ -335,6 +341,9 @@ func TestMySQLTaskTransitionStoreFailsExpiredTaskAndEventAtomicallyIntegration(t
 	if err != nil {
 		t.Fatalf("NewTaskTransitionStore returned error: %v", err)
 	}
+	if err := cleanupActiveTasks(ctx, db); err != nil {
+		t.Fatalf("cleanupActiveTasks returned error: %v", err)
+	}
 
 	suffix := time.Now().UnixNano()
 	taskID := fmt.Sprintf("task_expired_transition_%d", suffix)
@@ -350,7 +359,7 @@ func TestMySQLTaskTransitionStoreFailsExpiredTaskAndEventAtomicallyIntegration(t
 		createdAt,
 	)
 	task.MaxRetries = 0
-	if err := creationStore.CreateTaskWithEvent(ctx, task, createdEvent); err != nil {
+	if _, err := creationStore.CreateTaskWithEvent(ctx, task, createdEvent); err != nil {
 		t.Fatalf("CreateTaskWithEvent returned error: %v", err)
 	}
 

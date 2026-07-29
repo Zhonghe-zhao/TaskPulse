@@ -27,35 +27,60 @@ func (s *MySQLTaskCreationStore) CreateTaskWithEvent(
 	ctx context.Context,
 	task *domain.Task,
 	event *domain.TaskEvent,
-) (err error) {
+) (*storeerrors.TaskCreationResult, error) {
 	if task == nil {
-		return storeerrors.ErrNilTask
+		return nil, storeerrors.ErrNilTask
 	}
 	if event == nil {
-		return storeerrors.ErrNilEvent
+		return nil, storeerrors.ErrNilEvent
 	}
 	if event.TaskID != task.ID {
-		return storeerrors.ErrTaskEventMismatch
+		return nil, storeerrors.ErrTaskEventMismatch
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin task creation transaction: %w", err)
+		return nil, fmt.Errorf("begin task creation transaction: %w", err)
 	}
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
-		}
-	}()
+	defer func() { _ = tx.Rollback() }()
 
-	if err = insertTask(ctx, tx, task); err != nil {
-		return err
+	if err := insertTask(ctx, tx, task); err != nil {
+		if errors.Is(err, storeerrors.ErrIdempotencyKeyAlreadyExists) {
+			_ = tx.Rollback()
+			existing, resolveErr := s.resolveIdempotentReplay(ctx, task)
+			if resolveErr != nil {
+				return nil, resolveErr
+			}
+			return &storeerrors.TaskCreationResult{
+				Task:    existing,
+				Created: false,
+			}, nil
+		}
+		return nil, err
 	}
-	if err = insertEvent(ctx, tx, event); err != nil {
-		return err
+	if err := insertEvent(ctx, tx, event); err != nil {
+		return nil, err
 	}
-	if err = tx.Commit(); err != nil {
-		return fmt.Errorf("commit task %q creation: %w", task.ID, err)
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit task %q creation: %w", task.ID, err)
 	}
-	return nil
+	return &storeerrors.TaskCreationResult{
+		Task:    task,
+		Created: true,
+	}, nil
+}
+
+func (s *MySQLTaskCreationStore) resolveIdempotentReplay(
+	ctx context.Context,
+	requested *domain.Task,
+) (*domain.Task, error) {
+	taskStore := &MySQLTaskStore{db: s.db}
+	existing, err := taskStore.getByIdempotencyKey(ctx, requested.IdempotencyKey)
+	if err != nil {
+		return nil, err
+	}
+	if !storeerrors.SameTaskCreationRequest(existing, requested) {
+		return nil, storeerrors.ErrIdempotencyConflict
+	}
+	return existing, nil
 }

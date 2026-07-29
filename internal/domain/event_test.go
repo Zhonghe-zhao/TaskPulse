@@ -104,6 +104,25 @@ func TestNewTaskExpiredEvent(t *testing.T) {
 	}
 }
 
+func TestNewTaskCanceledEvent(t *testing.T) {
+	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	task, err := NewTask("task_1", "llm_analysis", nil, 3, now)
+	if err != nil {
+		t.Fatalf("NewTask returned error: %v", err)
+	}
+	if err := task.MoveTo(TaskStatusCanceled, now.Add(time.Second)); err != nil {
+		t.Fatalf("MoveTo canceled returned error: %v", err)
+	}
+
+	event, err := NewTaskCanceledEvent("event_canceled", task, now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("NewTaskCanceledEvent returned error: %v", err)
+	}
+	if event.Type != EventTaskCanceled || event.TaskID != task.ID {
+		t.Fatalf("unexpected canceled event: %+v", event)
+	}
+}
+
 func TestNewTaskRetryingEvent(t *testing.T) {
 	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
 	task, err := NewTask("task_1", "llm_analysis", nil, 3, now)
