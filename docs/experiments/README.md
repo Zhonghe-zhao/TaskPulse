@@ -22,3 +22,17 @@ NN-short-experiment-name.md
 ```
 
 压测和故障恢复实验应保存命令、关键输出和结论，避免只留下“测试通过”。
+
+## 当前实验
+
+- `01-memory-task-store.md`：内存任务存储的并发保护和复制边界。
+- `02-task-service.md`：应用层创建任务和事件的用例编排。
+- `03-llm-analysis-workflow.md`：第二类 workflow 的执行闭环。
+- `04-observability-baseline.md`：结构化日志和 `/metrics` 基线。
+- `05-retry-observability-experiment.md`：LLM 限流重试的事件和指标证据。
+- `06-worker-crash-recovery.md`：Worker 崩溃后的租约恢复和版本隔离。
+- `07-multi-worker-claim.md`：多个 Worker 并发领取任务和任务互斥。
+- `08-multi-process-claim.md`：多个 TaskPulse 进程共享 MySQL 队列的验证边界。
+- `09-worker-throughput-baseline.md`：不同 Worker 数量下的吞吐和队列等待基线。
+- `10-running-task-cancellation.md`：运行中任务取消和 Executor Context 停止。
+- `11-external-worker-protocol.md`：外部 Worker 领取、续租和结果提交协议。

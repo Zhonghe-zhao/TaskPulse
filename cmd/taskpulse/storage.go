@@ -23,6 +23,7 @@ type taskRuntimeStore interface {
 
 type runtimeStores struct {
 	tasks          store.TaskStore
+	taskStats      store.TaskStatsStore
 	events         store.EventStore
 	taskCreation   store.TaskCreationStore
 	taskTransition taskRuntimeStore
@@ -36,6 +37,7 @@ func openRuntimeStores(ctx context.Context, backend string) (runtimeStores, erro
 		eventStore := store.NewMemoryEventStore()
 		return runtimeStores{
 			tasks:          taskStore,
+			taskStats:      taskStore,
 			events:         eventStore,
 			taskCreation:   store.NewMemoryTaskCreationStore(taskStore, eventStore),
 			taskTransition: store.NewMemoryTaskTransitionStore(taskStore, eventStore),
@@ -74,6 +76,7 @@ func openRuntimeStores(ctx context.Context, backend string) (runtimeStores, erro
 		}
 		return runtimeStores{
 			tasks:          taskStore,
+			taskStats:      taskStore,
 			events:         eventStore,
 			taskCreation:   taskCreationStore,
 			taskTransition: taskTransitionStore,

@@ -1,7 +1,7 @@
 # TaskPulse MVP 路线图
 
 - 文档状态：执行中
-- 最近更新：2026-07-29
+- 最近更新：2026-07-30
 - 当前里程碑：MySQL 持久化
 
 ## MVP 目标
@@ -64,7 +64,7 @@
 - [x] 指数退避和最大重试次数
 - [ ] 死信终态
 - [x] 取消 queued/retrying 任务 API，并原子写入 canceled Event（ADR-0008）
-- [ ] 运行中任务的取消请求与 Context 协作式取消
+- [x] 运行中任务的取消请求与 Context 协作式取消
 - [x] 条件更新和版本号防止并发状态覆盖
 - [ ] 实验：杀死 Worker 后任务恢复
 - [ ] 实验：重复执行不产生错误终态
@@ -73,21 +73,23 @@
 
 问题：需要证明 TaskPulse 不依赖 URL 业务，并能承载耗时、受限流影响的智能任务。
 
-- [ ] 定义 `llm_analysis` 输入输出
-- [ ] 定义可替换的 LLM Client 接口
-- [ ] 实现 Fake Client 测试
+- [x] 定义 `llm_analysis` 输入输出
+- [x] 定义可替换的 LLM Client 接口
+- [x] 实现 Fake Client 测试
 - [ ] 接入一个真实模型 Provider
 - [ ] 记录模型、Token、耗时和错误类型
-- [ ] 对 429、5xx 和超时应用重试策略
+- [x] 定义 429、5xx 和超时的通用错误分类
 - [ ] 限制 Agent/LLM 任务并发量
 
 第一版不做动态工作流、多 Agent 协作、任意代码执行和插件市场。
 
 ## 里程碑四：工程证据
 
-- [ ] 结构化日志
-- [ ] Prometheus `/metrics`
-- [ ] 队列积压、等待时间、执行耗时、成功率和重试指标
+- [x] Worker/Reaper 结构化日志
+- [x] Prometheus 文本格式 `/metrics`
+- [x] 执行耗时、完成状态、重试、租约和 Reaper 清理指标
+- [x] 队列积压和最老可领取任务等待时间指标
+- [ ] 成功率聚合指标
 - [ ] Dockerfile 与 Docker Compose
 - [ ] k6 压力测试
 - [ ] P50、P95、P99 报告

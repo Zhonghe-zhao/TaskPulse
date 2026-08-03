@@ -1,8 +1,8 @@
 # TaskPulse 系统架构
 
 - 文档状态：当前架构说明
-- 最近更新：2026-07-29
-- 相关决策：[ADR-0001：使用 MySQL 8](adr/0001-use-mysql-as-system-of-record.md)、[ADR-0002：原子创建任务与初始事件](adr/0002-atomic-task-and-created-event.md)、[ADR-0003：原子提交任务终态与终态事件](adr/0003-atomic-terminal-task-transition.md)、[ADR-0004：原子提交任务领取与领取事件](adr/0004-atomic-task-claim-event.md)、[ADR-0005：原子提交过期任务失败与失败事件](adr/0005-atomic-expired-task-failure.md)、[ADR-0006：通用错误分类与重试语义](adr/0006-generic-retry-semantics.md)、[ADR-0007：任务创建幂等](adr/0007-idempotent-task-creation.md)、[ADR-0008：原子取消待执行任务](adr/0008-cancel-pending-tasks.md)
+- 最近更新：2026-07-30
+- 相关决策：[ADR-0001：使用 MySQL 8](adr/0001-use-mysql-as-system-of-record.md)、[ADR-0002：原子创建任务与初始事件](adr/0002-atomic-task-and-created-event.md)、[ADR-0003：原子提交任务终态与终态事件](adr/0003-atomic-terminal-task-transition.md)、[ADR-0004：原子提交任务领取与领取事件](adr/0004-atomic-task-claim-event.md)、[ADR-0005：原子提交过期任务失败与失败事件](adr/0005-atomic-expired-task-failure.md)、[ADR-0006：通用错误分类与重试语义](adr/0006-generic-retry-semantics.md)、[ADR-0007：任务创建幂等](adr/0007-idempotent-task-creation.md)、[ADR-0008：原子取消待执行任务](adr/0008-cancel-pending-tasks.md)、[ADR-0009：静态 LLM Analysis Workflow](adr/0009-static-llm-analysis-workflow.md)
 
 ## 架构目标
 
@@ -34,15 +34,15 @@ worker.Worker + Reaper
   │
   ▼
 Executor Registry
-  │ workflow=url_check
+  │ workflow=url_check / llm_analysis
   ▼
-URLCheckExecutor
-  │ 最多 5 个并发 HTTP 请求
+URLCheckExecutor / LLMAnalysisExecutor
+  │ URL 检测或 LLM 分析
   ▼
 Result + TaskEvent
 ```
 
-API 创建任务后立即返回。后台 Worker 使用 MySQL 事务原子领取任务并调用对应 Executor，通过租约心跳和版本号处理崩溃恢复与旧 Worker 隔离。Reaper 将重试额度耗尽的过期任务收敛为失败。单个进程当前只有一个任务级 Worker，因此多个 Task 之间顺序执行；单个 URL Check Task 内部最多并发检测 5 个 URL。
+API 创建任务后立即返回。后台 Worker 使用 MySQL 事务原子领取任务并调用对应 Executor，通过租约心跳和版本号处理崩溃恢复与旧 Worker 隔离。Reaper 将重试额度耗尽的过期任务收敛为失败。单个进程当前只有一个任务级 Worker，因此多个 Task 之间顺序执行；单个 URL Check Task 内部最多并发检测 5 个 URL。`llm_analysis` 当前使用 Fake LLM Client 验证执行边界，尚未接入真实 Provider。
 
 ## 当前模块
 
@@ -55,6 +55,8 @@ API 创建任务后立即返回。后台 Worker 使用 MySQL 事务原子领取�
 | HTTP Transport | `internal/transport/http` | HTTP 路由、请求解析和响应映射 |
 | Worker | `internal/worker` | 领取任务、选择 Executor、保存结果和终态事件 |
 | URL Check Executor | `internal/executor/urlcheck` | 校验 URL、有界并发请求、汇总成功/部分成功/失败 |
+| LLM Analysis Executor | `internal/executor/llmanalysis` | 解析 LLM 分析输入、调用可替换 Client、分类 Provider 错误、生成结构化结果 |
+| Observability | `internal/observability` | 暴露 Prometheus 文本格式指标，记录任务执行、重试、租约和 Reaper 行为 |
 | Identity | `internal/identity` | 生成进程内唯一的 Task/Event ID |
 | Database Platform | `internal/platform/database` | MySQL 配置校验、连接池创建和连通性检查 |
 
@@ -70,6 +72,9 @@ worker → domain
 executor/urlcheck → worker.Executor contract
                   └→ domain.Task
 
+executor/llmanalysis → worker.Executor contract
+                     └→ domain.Task
+
 store implementations → domain
 ```
 
@@ -80,6 +85,7 @@ store implementations → domain
 3. URL 特有规则不能进入 TaskPulse 通用 Domain 或 Store。
 4. Memory/MySQL Store 的替换不应要求修改 Handler 和 Executor。
 5. Executor 返回执行结果，不直接决定任务如何持久化。
+6. LLM Provider 的超时、限流和上游错误由 Executor/Client 分类，Worker 只理解通用执行错误。
 
 ## 当前已经具备的能力
 
@@ -102,15 +108,19 @@ store implementations → domain
 - 重试额度耗尽后的 Reaper 失败清理。
 - Worker 根据 workflow 选择 Executor。
 - URL 检测的有界并发、结果顺序保持和部分成功语义。
+- `llm_analysis` 静态 workflow、可替换 LLM Client、Fake Client 和 LLM 错误分类边界。
+- Worker/Reaper 结构化日志，记录领取、完成、失败、重试、续租和过期清理。
+- `/metrics` Prometheus 文本格式指标，记录任务状态分布、可领取任务积压、最老等待时间、任务领取、完成、重试、租约和执行耗时。
 - Context 传递、HTTP 超时和进程信号处理。
 - Domain、Store、Application、HTTP、Worker、Executor 单元测试。
 
 ## 当前明确不具备的保证
 
-- 人工死信重放和运行中任务的协作式取消尚未完成。
+- 人工死信重放尚未完成。
 - 实时事件推送尚未完成。
+- `llm_analysis` 尚未接入真实 LLM Provider，当前只用 Fake Client 验证执行链路。
 - SSRF 防护；当前 URL Executor 不能直接暴露到公网。
-- Redis、Prometheus 或 Kubernetes 运行能力。
+- 尚未接入 Prometheus Server、Grafana、Redis 或 Kubernetes。
 
 这些是后续要通过实现和实验获得的能力，不能在项目介绍中表述为已经完成。
 
@@ -181,19 +191,19 @@ BEGIN
 当前保证：多个进程竞争时只有一个 Worker 获得该任务，任务领取和 started/recovered
 事件在同一事务提交，同时为崩溃恢复留下租约信息。
 
-### 取消待执行任务
+### 取消任务
 
 ```text
 BEGIN
 → SELECT task BY id FOR UPDATE
-→ 校验状态为 queued/retrying
+→ 校验状态为 queued/retrying/running
 → UPDATE status=canceled, clear lease, version=version+1
 → INSERT task_canceled event
 → COMMIT
 ```
 
-当前保证：取消与 Worker 领取竞争时只有一方能够完成状态转换；重复取消返回已经取消的任务，
-不会重复写入取消事件。running 任务不会被直接标记为 canceled。
+当前保证：取消与 Worker 领取或终态提交竞争时只有一方能够完成状态转换；重复取消返回已经取消的任务，
+不会重复写入取消事件。运行中的 Worker 会因租约条件失效取消 Executor Context，旧 Worker 不能覆盖 canceled 状态。
 
 ### 清理重试耗尽的过期任务
 
@@ -211,7 +221,7 @@ BEGIN
 ## 后续演进条件
 
 - Redis Streams：MySQL 队列基线完成，并测得轮询/锁竞争问题或需要独立消费组后再决策。
-- Prometheus：出现持久化 Worker 后引入，观测积压、等待时间、吞吐、错误和重试。
+- Prometheus Server/Grafana：在 `/metrics` 基线稳定后接入，观测积压、等待时间、吞吐、错误和重试。
 - Docker Compose：MySQL/Redis/Prometheus 等多组件出现时，用于可重复开发与测试环境。
 - Kubernetes：API/Worker 已拆分、持久化和崩溃恢复完成后，用 Pod Kill 实验验证多副本行为。
 
