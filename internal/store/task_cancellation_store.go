@@ -63,7 +63,9 @@ func (s *MemoryTaskTransitionStore) CancelTaskWithEvent(
 			Canceled: false,
 		}, nil
 	}
-	if stored.Status != domain.TaskStatusQueued && stored.Status != domain.TaskStatusRetrying {
+	if stored.Status != domain.TaskStatusQueued &&
+		stored.Status != domain.TaskStatusRetrying &&
+		stored.Status != domain.TaskStatusRunning {
 		return nil, ErrTaskNotCancelable
 	}
 	if _, exists := s.eventStore.eventsByID[eventID]; exists {

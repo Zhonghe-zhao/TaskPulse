@@ -249,7 +249,7 @@ func TestTaskServiceCancelsQueuedTaskIdempotently(t *testing.T) {
 	}
 }
 
-func TestTaskServiceRejectsRunningTaskCancellation(t *testing.T) {
+func TestTaskServiceCancelsRunningTask(t *testing.T) {
 	ctx := context.Background()
 	taskStore := store.NewMemoryTaskStore()
 	eventStore := store.NewMemoryEventStore()
@@ -275,8 +275,12 @@ func TestTaskServiceRejectsRunningTaskCancellation(t *testing.T) {
 		t.Fatalf("ClaimNextWithEvent returned error: %v", err)
 	}
 
-	if _, err := service.CancelTask(ctx, created.Task.ID); !errors.Is(err, store.ErrTaskNotCancelable) {
-		t.Fatalf("expected ErrTaskNotCancelable, got %v", err)
+	canceled, err := service.CancelTask(ctx, created.Task.ID)
+	if err != nil {
+		t.Fatalf("CancelTask returned error: %v", err)
+	}
+	if canceled.Status != domain.TaskStatusCanceled {
+		t.Fatalf("expected canceled task, got %+v", canceled)
 	}
 }
 

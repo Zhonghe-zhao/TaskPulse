@@ -51,7 +51,9 @@ func (s *MySQLTaskTransitionStore) CancelTaskWithEvent(
 			Canceled: false,
 		}, nil
 	}
-	if task.Status != domain.TaskStatusQueued && task.Status != domain.TaskStatusRetrying {
+	if task.Status != domain.TaskStatusQueued &&
+		task.Status != domain.TaskStatusRetrying &&
+		task.Status != domain.TaskStatusRunning {
 		return nil, storeerrors.ErrTaskNotCancelable
 	}
 

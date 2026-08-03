@@ -22,6 +22,10 @@ type delayedExecutor struct {
 	result ExecutionResult
 }
 
+type cancellationAwareExecutor struct {
+	started chan<- struct{}
+}
+
 type retryOnceExecutor struct {
 	calls      atomic.Int32
 	firstErr   error
@@ -46,6 +50,12 @@ func (e delayedExecutor) Execute(ctx context.Context, _ *domain.Task) (Execution
 	}
 }
 
+func (e cancellationAwareExecutor) Execute(ctx context.Context, _ *domain.Task) (ExecutionResult, error) {
+	close(e.started)
+	<-ctx.Done()
+	return ExecutionResult{}, ctx.Err()
+}
+
 type countingTaskStore struct {
 	store.TaskStore
 	renewals atomic.Int32
@@ -55,8 +65,17 @@ type lostLeaseTaskStore struct {
 	store.TaskStore
 }
 
+type cancelDuringRenewTaskStore struct {
+	store.TaskStore
+}
+
 func (s *lostLeaseTaskStore) RenewLease(context.Context, store.RenewLeaseOptions) error {
 	return store.ErrLeaseLost
+}
+
+func (s *cancelDuringRenewTaskStore) RenewLease(ctx context.Context, _ store.RenewLeaseOptions) error {
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 func (s *countingTaskStore) RenewLease(ctx context.Context, options store.RenewLeaseOptions) error {
@@ -368,6 +387,106 @@ func TestWorkerRenewsLeaseDuringLongExecution(t *testing.T) {
 	}
 	if taskStore.renewals.Load() == 0 {
 		t.Fatal("expected at least one lease renewal")
+	}
+}
+
+func TestWorkerIgnoresRenewalCanceledAfterSuccessfulExecution(t *testing.T) {
+	ctx := context.Background()
+	memoryStore := store.NewMemoryTaskStore()
+	taskStore := &cancelDuringRenewTaskStore{TaskStore: memoryStore}
+	eventStore := store.NewMemoryEventStore()
+	task := createTask(t, taskStore, eventStore)
+	transitionStore := store.NewMemoryTaskTransitionStore(memoryStore, eventStore)
+
+	w := New(taskStore, transitionStore, map[string]Executor{
+		"url_check": delayedExecutor{
+			delay: 20 * time.Millisecond,
+			result: ExecutionResult{
+				Output:  json.RawMessage(`{"ok":true}`),
+				Outcome: OutcomeSucceeded,
+			},
+		},
+	}, nil)
+	w.leaseDuration = 15 * time.Millisecond
+
+	processed, err := w.ProcessNext(ctx)
+	if err != nil {
+		t.Fatalf("ProcessNext returned error: %v", err)
+	}
+	if !processed {
+		t.Fatal("expected one task to be processed")
+	}
+
+	stored, err := memoryStore.Get(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("Get returned error: %v", err)
+	}
+	if stored.Status != domain.TaskStatusSucceeded {
+		t.Fatalf("expected task to succeed, got %s", stored.Status)
+	}
+}
+
+func TestWorkerStopsExecutionWhenRunningTaskIsCanceled(t *testing.T) {
+	ctx := context.Background()
+	taskStore := store.NewMemoryTaskStore()
+	eventStore := store.NewMemoryEventStore()
+	task := createTask(t, taskStore, eventStore)
+	transitionStore := store.NewMemoryTaskTransitionStore(taskStore, eventStore)
+	started := make(chan struct{})
+
+	w := New(taskStore, transitionStore, map[string]Executor{
+		"url_check": cancellationAwareExecutor{started: started},
+	}, nil)
+	w.leaseDuration = 15 * time.Millisecond
+
+	processResult := make(chan error, 1)
+	go func() {
+		_, err := w.ProcessNext(ctx)
+		processResult <- err
+	}()
+	<-started
+
+	if _, err := transitionStore.CancelTaskWithEvent(
+		ctx,
+		task.ID,
+		"event_canceled",
+		task.CreatedAt.Add(time.Second),
+	); err != nil {
+		t.Fatalf("CancelTaskWithEvent returned error: %v", err)
+	}
+
+	select {
+	case err := <-processResult:
+		if !errors.Is(err, store.ErrLeaseLost) {
+			t.Fatalf("expected ErrLeaseLost after cancellation, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker did not stop canceled task")
+	}
+
+	stored, err := taskStore.Get(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("Get returned error: %v", err)
+	}
+	if stored.Status != domain.TaskStatusCanceled {
+		t.Fatalf("expected canceled task, got %s", stored.Status)
+	}
+	events, err := eventStore.ListByTaskID(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("ListByTaskID returned error: %v", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("unexpected event sequence: %+v", events)
+	}
+	foundCanceled := false
+	for _, event := range events {
+		if event.Type == domain.EventTaskCanceled {
+			foundCanceled = true
+			break
+		}
+	}
+	if !foundCanceled {
+		t.Fatalf("expected task_canceled event, got %+v", events)
 	}
 }
 

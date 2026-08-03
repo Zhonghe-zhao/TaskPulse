@@ -111,7 +111,7 @@ func TestMemoryTaskCancellationStoreCancelsRetryingTask(t *testing.T) {
 	}
 }
 
-func TestMemoryTaskCancellationStoreRejectsRunningTask(t *testing.T) {
+func TestMemoryTaskCancellationStoreCancelsRunningTask(t *testing.T) {
 	ctx := context.Background()
 	taskStore := NewMemoryTaskStore()
 	eventStore := NewMemoryEventStore()
@@ -128,13 +128,17 @@ func TestMemoryTaskCancellationStoreRejectsRunningTask(t *testing.T) {
 		t.Fatalf("ClaimNext returned error: %v", err)
 	}
 
-	if _, err := cancellationStore.CancelTaskWithEvent(
+	result, err := cancellationStore.CancelTaskWithEvent(
 		ctx,
 		task.ID,
 		"event_canceled",
 		task.CreatedAt.Add(2*time.Second),
-	); !errors.Is(err, ErrTaskNotCancelable) {
-		t.Fatalf("expected ErrTaskNotCancelable, got %v", err)
+	)
+	if err != nil {
+		t.Fatalf("CancelTaskWithEvent returned error: %v", err)
+	}
+	if !result.Canceled || result.Task.Status != domain.TaskStatusCanceled {
+		t.Fatalf("unexpected cancellation result: %+v", result)
 	}
 }
 
