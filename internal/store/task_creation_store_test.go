@@ -89,7 +89,7 @@ func TestMemoryTaskCreationStoreReplaysSameIdempotentRequest(t *testing.T) {
 	}
 }
 
-func TestMemoryTaskCreationStoreRejectsDifferentIdempotentRequest(t *testing.T) {
+func TestMemoryTaskCreationStoreAllowsSameIdempotencyKeyAcrossWorkflows(t *testing.T) {
 	ctx := context.Background()
 	taskStore := NewMemoryTaskStore()
 	eventStore := NewMemoryEventStore()
@@ -103,8 +103,12 @@ func TestMemoryTaskCreationStoreRejectsDifferentIdempotentRequest(t *testing.T) 
 	conflictTask.IdempotencyKey = firstTask.IdempotencyKey
 	conflictTask.Workflow = "different_workflow"
 
-	if _, err := creator.CreateTaskWithEvent(ctx, conflictTask, conflictEvent); !errors.Is(err, ErrIdempotencyConflict) {
-		t.Fatalf("expected ErrIdempotencyConflict, got %v", err)
+	result, err := creator.CreateTaskWithEvent(ctx, conflictTask, conflictEvent)
+	if err != nil {
+		t.Fatalf("expected different workflow to allow the same idempotency key, got %v", err)
+	}
+	if !result.Created || result.Task.ID != conflictTask.ID {
+		t.Fatalf("expected a new task for the different workflow, got %+v", result)
 	}
 }
 

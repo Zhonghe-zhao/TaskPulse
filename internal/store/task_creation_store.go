@@ -71,7 +71,8 @@ func (s *MemoryTaskCreationStore) CreateTaskWithEvent(
 	defer s.eventStore.mu.Unlock()
 
 	if task.IdempotencyKey != "" {
-		if taskID, exists := s.taskStore.taskIDsByIdempotencyKey[task.IdempotencyKey]; exists {
+		indexKey := idempotencyIndexKey(task.Workflow, task.IdempotencyKey)
+		if taskID, exists := s.taskStore.taskIDsByIdempotencyKey[indexKey]; exists {
 			existing := s.taskStore.tasks[taskID]
 			if !SameTaskCreationRequest(existing, task) {
 				return nil, ErrIdempotencyConflict
@@ -93,7 +94,7 @@ func (s *MemoryTaskCreationStore) CreateTaskWithEvent(
 	copiedEvent := cloneTaskEvent(event)
 	s.taskStore.tasks[task.ID] = copiedTask
 	if task.IdempotencyKey != "" {
-		s.taskStore.taskIDsByIdempotencyKey[task.IdempotencyKey] = task.ID
+		s.taskStore.taskIDsByIdempotencyKey[idempotencyIndexKey(task.Workflow, task.IdempotencyKey)] = task.ID
 	}
 	s.eventStore.eventsByID[event.ID] = copiedEvent
 	s.eventStore.eventsByTaskID[event.TaskID] = append(

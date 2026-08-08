@@ -57,7 +57,7 @@ SELECT
 FROM tasks
 WHERE id = ?`
 
-const getTaskByIdempotencyKeyQuery = `
+const getTaskByWorkflowAndIdempotencyKeyQuery = `
 SELECT
     id,
     idempotency_key,
@@ -78,7 +78,8 @@ SELECT
     started_at,
     finished_at
 FROM tasks
-WHERE idempotency_key = ?`
+WHERE workflow = ?
+  AND idempotency_key = ?`
 
 const claimNextTaskQuery = `
 SELECT
@@ -129,6 +130,63 @@ SELECT
     finished_at
 FROM tasks
 WHERE status = ?
+  AND lease_expires_at <= ?
+  AND retry_count < max_retries
+ORDER BY lease_expires_at, created_at, id
+LIMIT 1
+FOR UPDATE SKIP LOCKED`
+
+const claimNextTaskByWorkflowQuery = `
+SELECT
+    id,
+    idempotency_key,
+    workflow,
+    status,
+    input_json,
+    result_json,
+    error_message,
+    progress,
+    retry_count,
+    max_retries,
+    available_at,
+    lease_owner,
+    lease_expires_at,
+    version,
+    created_at,
+    updated_at,
+    started_at,
+    finished_at
+FROM tasks
+WHERE status IN (?, ?)
+  AND workflow = ?
+  AND available_at <= ?
+ORDER BY available_at, created_at, id
+LIMIT 1
+FOR UPDATE SKIP LOCKED`
+
+const claimExpiredTaskByWorkflowQuery = `
+SELECT
+    id,
+    idempotency_key,
+    workflow,
+    status,
+    input_json,
+    result_json,
+    error_message,
+    progress,
+    retry_count,
+    max_retries,
+    available_at,
+    lease_owner,
+    lease_expires_at,
+    version,
+    created_at,
+    updated_at,
+    started_at,
+    finished_at
+FROM tasks
+WHERE status = ?
+  AND workflow = ?
   AND lease_expires_at <= ?
   AND retry_count < max_retries
 ORDER BY lease_expires_at, created_at, id
@@ -237,7 +295,8 @@ func insertTask(ctx context.Context, executor sqlExecutor, task *domain.Task) er
 	if err != nil {
 		var mysqlError *mysqldriver.MySQLError
 		if errors.As(err, &mysqlError) && mysqlError.Number == 1062 {
-			if strings.Contains(mysqlError.Message, "uk_tasks_idempotency_key") {
+			if strings.Contains(mysqlError.Message, "uk_tasks_workflow_idempotency") ||
+				strings.Contains(mysqlError.Message, "uk_tasks_idempotency_key") {
 				return storeerrors.ErrIdempotencyKeyAlreadyExists
 			}
 			return storeerrors.ErrTaskAlreadyExists
@@ -258,13 +317,15 @@ func (s *MySQLTaskStore) Get(ctx context.Context, id string) (*domain.Task, erro
 	return task, nil
 }
 
-func (s *MySQLTaskStore) getByIdempotencyKey(
+func (s *MySQLTaskStore) getByWorkflowAndIdempotencyKey(
 	ctx context.Context,
+	workflow string,
 	idempotencyKey string,
 ) (*domain.Task, error) {
 	task, err := scanTask(s.db.QueryRowContext(
 		ctx,
-		getTaskByIdempotencyKeyQuery,
+		getTaskByWorkflowAndIdempotencyKeyQuery,
+		workflow,
 		idempotencyKey,
 	))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -305,23 +366,30 @@ func claimNextInTx(
 	tx *sql.Tx,
 	options storeerrors.ClaimOptions,
 ) (*domain.Task, domain.ClaimKind, error) {
+	expiredQuery := claimExpiredTaskQuery
+	expiredArgs := []any{string(domain.TaskStatusRunning), options.Now.UTC()}
+	nextQuery := claimNextTaskQuery
+	nextArgs := []any{string(domain.TaskStatusQueued), string(domain.TaskStatusRetrying), options.Now.UTC()}
+	if options.Workflow != "" {
+		expiredQuery = claimExpiredTaskByWorkflowQuery
+		expiredArgs = []any{string(domain.TaskStatusRunning), options.Workflow, options.Now.UTC()}
+		nextQuery = claimNextTaskByWorkflowQuery
+		nextArgs = []any{string(domain.TaskStatusQueued), string(domain.TaskStatusRetrying), options.Workflow, options.Now.UTC()}
+	}
 	now := options.Now.UTC() //统一时间
 	//优先查询过期任务
 	task, err := scanTask(tx.QueryRowContext(
 		ctx,
-		claimExpiredTaskQuery,
-		string(domain.TaskStatusRunning),
-		now,
+		expiredQuery,
+		expiredArgs...,
 	))
 	claimKind := domain.ClaimRecovery // 优先接管租约过期的 running 任务。
 	if errors.Is(err, sql.ErrNoRows) {
 		// 没有可恢复任务时，再查询已到期的 queued/retrying 任务。
 		task, err = scanTask(tx.QueryRowContext(
 			ctx,
-			claimNextTaskQuery,
-			string(domain.TaskStatusQueued),
-			string(domain.TaskStatusRetrying),
-			now,
+			nextQuery,
+			nextArgs...,
 		))
 		if err == nil {
 			if task.Status == domain.TaskStatusRetrying {

@@ -24,6 +24,7 @@ var (
 
 type ClaimOptions struct {
 	WorkerID      string
+	Workflow      string
 	Now           time.Time
 	LeaseDuration time.Duration
 }

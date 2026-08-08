@@ -50,13 +50,15 @@ func TestMySQLTaskCreationStoreCommitsTaskAndEventIntegration(t *testing.T) {
 	taskID := fmt.Sprintf("task_atomic_%d", suffix)
 	eventID := fmt.Sprintf("event_atomic_%d", suffix)
 	rollbackTaskID := fmt.Sprintf("task_atomic_rollback_%d", suffix)
+	conflictTaskID := fmt.Sprintf("task_atomic_conflict_%d", suffix)
 	caseVariantTaskID := fmt.Sprintf("task_atomic_case_variant_%d", suffix)
 	t.Cleanup(func() {
 		_, _ = db.ExecContext(
 			context.Background(),
-			"DELETE FROM tasks WHERE id IN (?, ?, ?)",
+			"DELETE FROM tasks WHERE id IN (?, ?, ?, ?)",
 			taskID,
 			rollbackTaskID,
+			conflictTaskID,
 			caseVariantTaskID,
 		)
 	})
@@ -99,14 +101,18 @@ func TestMySQLTaskCreationStoreCommitsTaskAndEventIntegration(t *testing.T) {
 
 	conflictTask, conflictEvent := newMySQLTaskCreationPair(
 		t,
-		fmt.Sprintf("task_atomic_conflict_%d", suffix),
+		conflictTaskID,
 		fmt.Sprintf("event_atomic_conflict_%d", suffix),
 		now.Add(2*time.Second),
 	)
 	conflictTask.IdempotencyKey = task.IdempotencyKey
 	conflictTask.Workflow = "different_workflow"
-	if _, err := creator.CreateTaskWithEvent(ctx, conflictTask, conflictEvent); !errors.Is(err, storeerrors.ErrIdempotencyConflict) {
-		t.Fatalf("expected ErrIdempotencyConflict, got %v", err)
+	conflictResult, err := creator.CreateTaskWithEvent(ctx, conflictTask, conflictEvent)
+	if err != nil {
+		t.Fatalf("expected different workflow to allow the same idempotency key, got %v", err)
+	}
+	if !conflictResult.Created || conflictResult.Task.ID != conflictTask.ID {
+		t.Fatalf("expected different workflow task to be created, got %+v", conflictResult)
 	}
 	events, err = eventStore.ListByTaskID(ctx, taskID)
 	if err != nil {

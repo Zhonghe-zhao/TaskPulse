@@ -37,16 +37,20 @@ func (s *MemoryTaskStore) Create(ctx context.Context, task *domain.Task) error {
 		return ErrTaskAlreadyExists
 	}
 	if task.IdempotencyKey != "" {
-		if _, exists := s.taskIDsByIdempotencyKey[task.IdempotencyKey]; exists {
+		if _, exists := s.taskIDsByIdempotencyKey[idempotencyIndexKey(task.Workflow, task.IdempotencyKey)]; exists {
 			return ErrIdempotencyConflict
 		}
 	}
 
 	s.tasks[task.ID] = cloneTask(task)
 	if task.IdempotencyKey != "" {
-		s.taskIDsByIdempotencyKey[task.IdempotencyKey] = task.ID
+		s.taskIDsByIdempotencyKey[idempotencyIndexKey(task.Workflow, task.IdempotencyKey)] = task.ID
 	}
 	return nil
+}
+
+func idempotencyIndexKey(workflow, key string) string {
+	return workflow + "\x00" + key
 }
 
 func (s *MemoryTaskStore) Get(ctx context.Context, id string) (*domain.Task, error) {
@@ -115,6 +119,9 @@ func (s *MemoryTaskStore) claimNextLocked(
 	var selected *domain.Task
 	claimKind := domain.ClaimInitial
 	for _, task := range s.tasks {
+		if options.Workflow != "" && task.Workflow != options.Workflow {
+			continue
+		}
 		if task.Status != domain.TaskStatusRunning ||
 			task.LeaseExpiresAt == nil ||
 			task.LeaseExpiresAt.After(options.Now) ||
@@ -131,6 +138,9 @@ func (s *MemoryTaskStore) claimNextLocked(
 
 	if selected == nil {
 		for _, task := range s.tasks {
+			if options.Workflow != "" && task.Workflow != options.Workflow {
+				continue
+			}
 			if (task.Status != domain.TaskStatusQueued && task.Status != domain.TaskStatusRetrying) ||
 				task.AvailableAt.After(options.Now) {
 				continue

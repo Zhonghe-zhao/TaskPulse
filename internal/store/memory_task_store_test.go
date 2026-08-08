@@ -138,6 +138,22 @@ func TestMemoryTaskStoreRejectsIdempotencyKeyChange(t *testing.T) {
 	}
 }
 
+func TestMemoryTaskStoreAllowsSameIdempotencyKeyAcrossWorkflows(t *testing.T) {
+	ctx := context.Background()
+	taskStore := NewMemoryTaskStore()
+	first := newTestTask(t, "task_1")
+	first.IdempotencyKey = "same-key"
+	second := newTestTask(t, "task_2")
+	second.Workflow = "memobridge.semantic_profile"
+	second.IdempotencyKey = first.IdempotencyKey
+	if err := taskStore.Create(ctx, first); err != nil {
+		t.Fatalf("first Create returned error: %v", err)
+	}
+	if err := taskStore.Create(ctx, second); err != nil {
+		t.Fatalf("same key in another workflow should be allowed: %v", err)
+	}
+}
+
 func TestMemoryTaskStoreRejectsUpdateForMissingTask(t *testing.T) {
 	ctx := context.Background()
 	store := NewMemoryTaskStore()
@@ -342,6 +358,43 @@ func TestMemoryTaskStoreWaitsUntilTaskIsAvailable(t *testing.T) {
 	}
 	if claimed.ID != task.ID {
 		t.Fatalf("expected task %s, got %s", task.ID, claimed.ID)
+	}
+}
+
+func TestMemoryTaskStoreClaimFiltersWorkflow(t *testing.T) {
+	ctx := context.Background()
+	taskStore := NewMemoryTaskStore()
+	other := newTestTask(t, "task_other")
+	other.Workflow = "other.workflow"
+	target := newTestTask(t, "task_target")
+	target.Workflow = "memobridge.semantic_profile"
+	if err := taskStore.Create(ctx, other); err != nil {
+		t.Fatalf("create other task returned error: %v", err)
+	}
+	if err := taskStore.Create(ctx, target); err != nil {
+		t.Fatalf("create target task returned error: %v", err)
+	}
+
+	claimed, err := taskStore.ClaimNext(ctx, ClaimOptions{
+		WorkerID:      "memobridge-worker-1",
+		Workflow:      "memobridge.semantic_profile",
+		Now:           target.CreatedAt.Add(time.Second),
+		LeaseDuration: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("ClaimNext returned error: %v", err)
+	}
+	if claimed.ID != target.ID || claimed.Workflow != target.Workflow {
+		t.Fatalf("expected target workflow task, got id=%s workflow=%s", claimed.ID, claimed.Workflow)
+	}
+
+	if _, err := taskStore.ClaimNext(ctx, ClaimOptions{
+		WorkerID:      "memobridge-worker-1",
+		Workflow:      "memobridge.semantic_profile",
+		Now:           target.CreatedAt.Add(time.Second),
+		LeaseDuration: time.Minute,
+	}); !errors.Is(err, ErrNoTaskAvailable) {
+		t.Fatalf("expected no matching task after claim, got %v", err)
 	}
 }
 
