@@ -91,25 +91,40 @@ func (h *Handler) ListTaskEvents(w http.ResponseWriter, r *http.Request) {
 
 type workerClaimRequest struct {
 	WorkerID      string `json:"worker_id"`
+	Workflow      string `json:"workflow"`
 	LeaseDuration string `json:"lease_duration"`
 }
 
 type workerHeartbeatRequest struct {
 	WorkerID      string `json:"worker_id"`
+	LeaseToken    string `json:"lease_token"`
 	LeaseDuration string `json:"lease_duration"`
 }
 
 type workerCompleteRequest struct {
-	WorkerID string          `json:"worker_id"`
-	Version  uint64          `json:"version"`
-	Output   json.RawMessage `json:"output"`
+	WorkerID   string          `json:"worker_id"`
+	LeaseToken string          `json:"lease_token"`
+	Version    uint64          `json:"version"`
+	Output     json.RawMessage `json:"output"`
+	ResultRef  json.RawMessage `json:"result_ref"`
+}
+
+type workerProgressRequest struct {
+	WorkerID   string `json:"worker_id"`
+	LeaseToken string `json:"lease_token"`
+	Version    uint64 `json:"version"`
+	Progress   int    `json:"progress"`
+	Message    string `json:"message"`
 }
 
 type workerFailRequest struct {
 	WorkerID     string `json:"worker_id"`
+	LeaseToken   string `json:"lease_token"`
 	Version      uint64 `json:"version"`
 	ErrorCode    string `json:"error_code"`
 	ErrorMessage string `json:"error_message"`
+	Retryable    bool   `json:"retryable"`
+	RetryAfter   string `json:"retry_after"`
 }
 
 func (h *Handler) ClaimWorkerTask(w http.ResponseWriter, r *http.Request) {
@@ -129,6 +144,7 @@ func (h *Handler) ClaimWorkerTask(w http.ResponseWriter, r *http.Request) {
 	}
 	task, err := h.workerTaskService.ClaimTask(r.Context(), application.ClaimTaskInput{
 		WorkerID:      request.WorkerID,
+		Workflow:      request.Workflow,
 		LeaseDuration: leaseDuration,
 	})
 	if errors.Is(err, store.ErrNoTaskAvailable) {
@@ -160,6 +176,7 @@ func (h *Handler) HeartbeatWorkerTask(w http.ResponseWriter, r *http.Request) {
 	task, err := h.workerTaskService.HeartbeatTask(r.Context(), application.HeartbeatTaskInput{
 		TaskID:        r.PathValue("task_id"),
 		WorkerID:      request.WorkerID,
+		LeaseToken:    request.LeaseToken,
 		LeaseDuration: leaseDuration,
 	})
 	if err != nil {
@@ -180,10 +197,37 @@ func (h *Handler) CompleteWorkerTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	task, err := h.workerTaskService.CompleteTask(r.Context(), application.CompleteTaskInput{
-		TaskID:  r.PathValue("task_id"),
+		TaskID:   r.PathValue("task_id"),
 		WorkerID: request.WorkerID,
-		Version: request.Version,
-		Output:  request.Output,
+		LeaseToken: request.LeaseToken,
+		Version:  request.Version,
+		Output:   request.Output,
+		ResultRef: request.ResultRef,
+	})
+	if err != nil {
+		writeApplicationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, task)
+}
+
+func (h *Handler) ReportWorkerProgress(w http.ResponseWriter, r *http.Request) {
+	if h.workerTaskService == nil {
+		writeError(w, http.StatusNotFound, "worker protocol is not configured")
+		return
+	}
+	var request workerProgressRequest
+	if err := decodeJSON(w, r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	task, err := h.workerTaskService.ReportProgress(r.Context(), application.ReportProgressInput{
+		TaskID:   r.PathValue("task_id"),
+		WorkerID: request.WorkerID,
+		LeaseToken: request.LeaseToken,
+		Version:  request.Version,
+		Progress: request.Progress,
+		Message:  request.Message,
 	})
 	if err != nil {
 		writeApplicationError(w, err)
@@ -202,18 +246,37 @@ func (h *Handler) FailWorkerTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	retryAfter, err := parseOptionalDuration(request.RetryAfter)
+	if err != nil {
+		writeApplicationError(w, err)
+		return
+	}
 	task, err := h.workerTaskService.FailTask(r.Context(), application.FailTaskInput{
 		TaskID:       r.PathValue("task_id"),
 		WorkerID:     request.WorkerID,
+		LeaseToken:   request.LeaseToken,
 		Version:      request.Version,
 		ErrorCode:    request.ErrorCode,
 		ErrorMessage: request.ErrorMessage,
+		Retryable:    request.Retryable,
+		RetryAfter:   retryAfter,
 	})
 	if err != nil {
 		writeApplicationError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, task)
+}
+
+func parseOptionalDuration(raw string) (time.Duration, error) {
+	if raw == "" {
+		return 0, nil
+	}
+	duration, err := time.ParseDuration(raw)
+	if err != nil || duration < 0 {
+		return 0, fmt.Errorf("%w: retry_after must be a non-negative duration", application.ErrInvalidWorkerRequest)
+	}
+	return duration, nil
 }
 
 func parseLeaseDuration(raw string) (time.Duration, error) {

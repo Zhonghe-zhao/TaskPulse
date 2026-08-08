@@ -11,6 +11,7 @@ func NewRouter(handler *Handler, metricsHandler ...http.Handler) http.Handler {
 	if handler.workerTaskService != nil {
 		mux.HandleFunc("POST /worker/tasks/claim", handler.ClaimWorkerTask)
 		mux.HandleFunc("POST /worker/tasks/{task_id}/heartbeat", handler.HeartbeatWorkerTask)
+		mux.HandleFunc("POST /worker/tasks/{task_id}/progress", handler.ReportWorkerProgress)
 		mux.HandleFunc("POST /worker/tasks/{task_id}/complete", handler.CompleteWorkerTask)
 		mux.HandleFunc("POST /worker/tasks/{task_id}/fail", handler.FailWorkerTask)
 	}

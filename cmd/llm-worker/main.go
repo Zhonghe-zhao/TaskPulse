@@ -23,6 +23,7 @@ import (
 type config struct {
 	TaskPulseURL string
 	WorkerID     string
+	Workflow     string
 	Lease        time.Duration
 	PollInterval time.Duration
 	HTTPClient   *http.Client
@@ -31,6 +32,7 @@ type config struct {
 type workerClient struct {
 	baseURL string
 	worker  string
+	workflow string
 	lease   time.Duration
 	client  *http.Client
 }
@@ -77,6 +79,7 @@ func main() {
 	client := &workerClient{
 		baseURL: cfg.TaskPulseURL,
 		worker:  cfg.WorkerID,
+		workflow: cfg.Workflow,
 		lease:   cfg.Lease,
 		client:  cfg.HTTPClient,
 	}
@@ -119,14 +122,33 @@ func processNext(
 		return false, err
 	}
 	logger.Info("external task claimed", "task_id", task.ID, "workflow", task.Workflow, "version", task.Version)
+	if _, err := client.reportProgress(ctx, task, 10, "preparing task"); err != nil {
+		if isConflict(err) {
+			logger.Warn("external task progress rejected", "task_id", task.ID, "error", err)
+			return true, nil
+		}
+		return true, err
+	}
+	logger.Debug("external task progress reported", "task_id", task.ID, "progress", 10)
 
 	result, executeErr := executeWithHeartbeat(ctx, client, executor, task)
 	if executeErr != nil {
+		// Pod termination, lease loss, and explicit shutdown cancel the execution
+		// context. The task must be recovered by TaskPulse, not reported as a
+		// business failure by a worker that is already stopping.
+		if errors.Is(executeErr, context.Canceled) {
+			logger.Warn("external task execution canceled", "task_id", task.ID, "error", executeErr)
+			return true, nil
+		}
 		code := "external_worker_error"
+		retryable := true
+		retryAfter := time.Duration(0)
 		if classified, ok := worker.AsExecutionError(executeErr); ok {
 			code = classified.Code
+			retryable = classified.Retryable()
+			retryAfter = classified.RetryAfter
 		}
-		if err := client.fail(ctx, task, code, executeErr.Error()); err != nil {
+		if err := client.fail(ctx, task, code, executeErr.Error(), retryable, retryAfter); err != nil {
 			if isConflict(err) {
 				logger.Warn("external task result rejected", "task_id", task.ID, "error", err)
 				return true, nil
@@ -136,6 +158,15 @@ func processNext(
 		logger.Warn("external task failed", "task_id", task.ID, "error_code", code, "error", executeErr)
 		return true, nil
 	}
+	progressed, err := client.reportProgress(ctx, task, 90, "validating result")
+	if err != nil {
+		if isConflict(err) {
+			logger.Warn("external task progress rejected", "task_id", task.ID, "error", err)
+			return true, nil
+		}
+		return true, err
+	}
+	task.Version = progressed.Version
 	if err := client.complete(ctx, task, result.Output); err != nil {
 		if isConflict(err) {
 			logger.Warn("external task result rejected", "task_id", task.ID, "error", err)
@@ -161,7 +192,12 @@ func executeWithHeartbeat(
 	result, executeErr := executor.Execute(executionCtx, task)
 	cancel()
 	heartbeatErr := <-heartbeatResult
-	if heartbeatErr != nil {
+	// A successful executor result wins over context cancellation caused by
+	// stopping the heartbeat loop. The cancellation is our own shutdown signal.
+	if executeErr == nil {
+		return result, nil
+	}
+	if heartbeatErr != nil && !errors.Is(heartbeatErr, context.Canceled) {
 		return worker.ExecutionResult{}, heartbeatErr
 	}
 	return result, executeErr
@@ -171,6 +207,7 @@ func (c *workerClient) claim(ctx context.Context) (*domain.Task, error) {
 	var task domain.Task
 	status, err := c.post(ctx, "/worker/tasks/claim", map[string]string{
 		"worker_id":      c.worker,
+		"workflow":       c.workflow,
 		"lease_duration": c.lease.String(),
 	}, &task)
 	if err != nil {
@@ -219,12 +256,41 @@ func (c *workerClient) complete(ctx context.Context, task *domain.Task, output j
 	return err
 }
 
-func (c *workerClient) fail(ctx context.Context, task *domain.Task, code, message string) error {
+func (c *workerClient) reportProgress(
+	ctx context.Context,
+	task *domain.Task,
+	progress int,
+	message string,
+) (*domain.Task, error) {
+	var updated domain.Task
+	_, err := c.post(ctx, "/worker/tasks/"+task.ID+"/progress", map[string]any{
+		"worker_id": c.worker,
+		"version":   task.Version,
+		"progress":  progress,
+		"message":   message,
+	}, &updated)
+	if err != nil {
+		return nil, err
+	}
+	task.Version = updated.Version
+	return &updated, nil
+}
+
+func (c *workerClient) fail(
+	ctx context.Context,
+	task *domain.Task,
+	code string,
+	message string,
+	retryable bool,
+	retryAfter time.Duration,
+) error {
 	_, err := c.post(ctx, "/worker/tasks/"+task.ID+"/fail", map[string]any{
 		"worker_id":     c.worker,
 		"version":       task.Version,
 		"error_code":    code,
 		"error_message": message,
+		"retryable":     retryable,
+		"retry_after":   retryAfter.String(),
 	}, nil)
 	return err
 }
@@ -282,6 +348,7 @@ func loadConfig() (config, error) {
 	return config{
 		TaskPulseURL: strings.TrimRight(defaultEnv("TASKPULSE_URL", "http://localhost:8080"), "/"),
 		WorkerID:     workerID,
+		Workflow:     defaultEnv("TASKPULSE_WORKER_WORKFLOW", "llm_analysis"),
 		Lease:        lease,
 		PollInterval: poll,
 		HTTPClient:   &http.Client{Timeout: 10 * time.Second},

@@ -45,6 +45,11 @@ type Task struct {
 	Version        uint64          `json:"version"`
 	LeaseOwner     string          `json:"lease_owner,omitempty"`
 	LeaseExpiresAt *time.Time      `json:"lease_expires_at,omitempty"`
+	// LeaseToken is an external protocol token derived when a task is claimed.
+	// The durable fencing state remains LeaseOwner, LeaseExpiresAt, and Version.
+	LeaseToken string          `json:"lease_token,omitempty"`
+	TaskID     string          `json:"task_id,omitempty"`
+	LeaseUntil *time.Time      `json:"lease_until,omitempty"`
 	CreatedAt      time.Time       `json:"created_at"`
 	UpdatedAt      time.Time       `json:"updated_at"`
 	StartedAt      *time.Time      `json:"started_at,omitempty"`

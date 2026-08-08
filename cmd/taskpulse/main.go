@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"log/slog"
 	"net/http"
@@ -13,9 +14,11 @@ import (
 
 	charmLog "github.com/charmbracelet/log"
 	"github.com/zhaozhonghe/taskpulse/internal/application"
+	"github.com/zhaozhonghe/taskpulse/internal/domain"
 	"github.com/zhaozhonghe/taskpulse/internal/executor/llmanalysis"
 	"github.com/zhaozhonghe/taskpulse/internal/executor/urlcheck"
 	"github.com/zhaozhonghe/taskpulse/internal/observability"
+	"github.com/zhaozhonghe/taskpulse/internal/store"
 	httptransport "github.com/zhaozhonghe/taskpulse/internal/transport/http"
 	"github.com/zhaozhonghe/taskpulse/internal/worker"
 )
@@ -53,6 +56,11 @@ func main() {
 		stores.tasks,
 		stores.taskTransition,
 	)
+	externalRetryScheduler, err := newExternalRetryScheduler(stores.taskTransition)
+	if err != nil {
+		log.Fatalf("initialize external retry scheduler: %v", err)
+	}
+	workerTaskService.WithRetryScheduler(externalRetryScheduler)
 	router := httptransport.NewRouter(
 		httptransport.NewHandlerWithWorker(taskService, workerTaskService),
 		metrics,
@@ -173,4 +181,56 @@ func main() {
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("HTTP server shutdown: %v", err)
 	}
+}
+
+type externalRetryScheduler struct {
+	scheduler *worker.RetryScheduler
+	policies  map[string]worker.RetryPolicy
+}
+
+func newExternalRetryScheduler(transitionStore store.TaskTransitionStore) (*externalRetryScheduler, error) {
+	scheduler, err := worker.NewRetryScheduler(
+		transitionStore,
+		worker.NewDefaultBackoffCalculator(),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &externalRetryScheduler{
+		scheduler: scheduler,
+		policies: map[string]worker.RetryPolicy{
+			"llm_analysis": {
+				MaxRetries: 3,
+				BaseDelay:  time.Second,
+				MaxDelay:   30 * time.Second,
+			},
+		},
+	}, nil
+}
+
+func (s *externalRetryScheduler) Schedule(
+	ctx context.Context,
+	task *domain.Task,
+	code string,
+	message string,
+	retryAfter time.Duration,
+) error {
+	policy, ok := s.policies[task.Workflow]
+	if !ok {
+		policy = worker.RetryPolicy{
+			MaxRetries: task.MaxRetries,
+			BaseDelay:  time.Second,
+			MaxDelay:   30 * time.Second,
+		}
+	}
+	executionError, err := worker.NewExecutionError(
+		worker.ErrorTransient,
+		code,
+		retryAfter,
+		errors.New(message),
+	)
+	if err != nil {
+		return err
+	}
+	return s.scheduler.Schedule(ctx, task, executionError, policy, time.Now())
 }
