@@ -1,0 +1,127 @@
+MemoBridge 与 TaskPulse 联调步骤
+
+一、当前状态
+
+TaskPulse 宿主机地址：http://127.0.0.1:8085
+TaskPulse 容器内部地址：http://taskpulse:8080
+MemoBridge Worker：已经启动并等待任务。
+
+本次先验证一个真实 SourceItem，不要一开始做批量任务。
+
+二、启动 Worker 所需环境变量
+
+$env:DATABASE_URL="postgres://用户名:密码@localhost:5432/真实数据库名?sslmode=disable"
+$env:TASKPULSE_URL="http://127.0.0.1:8085"
+$env:TASKPULSE_WORKER_ID="memobridge-worker-1"
+$env:TASKPULSE_LEASE_DURATION="30s"
+$env:TASKPULSE_POLL_INTERVAL="1s"
+$env:TASKPULSE_HEARTBEAT_INTERVAL="10s"
+
+使用真实 LLM 时还要设置：
+
+$env:AI_PROVIDER="deepseek"
+$env:DEEPSEEK_API_KEY="你的 API Key"
+
+这些变量必须在启动 Worker 的同一个 PowerShell 窗口中设置。
+
+三、选择真实 SourceItem
+
+假设 SourceItem ID 是 11778。
+
+$item = Invoke-RestMethod "http://127.0.0.1:<MemoBridge端口>/source-items/11778"
+$item
+
+确认资料存在，并且包含 title、type、role、source、source_url、source_ref、labels、content。
+
+四、计算 content_hash
+
+MemoBridge 的 hash 输入顺序是：title、type、role、source、source_url、source_ref、labels、content。
+
+$parts = @(
+    [string]$item.title,
+    [string]$item.type,
+    [string]$item.role,
+    [string]$item.source,
+    [string]$item.source_url,
+    [string]$item.source_ref,
+    [string]$item.labels,
+    [string]$item.content
+)
+$canonical = [string]::Join([char]0, $parts)
+$bytes = [System.Text.Encoding]::UTF8.GetBytes($canonical)
+$sha = [System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes)
+$contentHash = "sha256:" + ([Convert]::ToHexString($sha).ToLowerInvariant())
+$contentHash
+
+不要手写 hash。hash 不正确时，MemoBridge 会返回 source_changed。
+
+五、创建 TaskPulse 任务
+
+$sourceItemID = 11778
+$promptVersion = "source_semantic_profile:v1"
+$idempotencyKey = "semantic-profile:$sourceItemID`:$contentHash`:$promptVersion"
+$body = @{
+    workflow = "memobridge.semantic_profile"
+    input = @{
+        source_item_id = $sourceItemID
+        content_hash = $contentHash
+        prompt_version = $promptVersion
+        requested_by = "manual_test"
+        batch_id = "batch_test_001"
+    }
+    max_retries = 3
+} | ConvertTo-Json -Depth 5
+$task = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8085/tasks" -Headers @{ "Idempotency-Key" = $idempotencyKey } -ContentType "application/json" -Body $body
+$task
+
+workflow 必须是 memobridge.semantic_profile。
+
+六、观察任务
+
+Invoke-RestMethod "http://127.0.0.1:8085/tasks/$($task.id)"
+Invoke-RestMethod "http://127.0.0.1:8085/tasks/$($task.id)/events"
+
+正常状态：queued -> running -> progress -> succeeded。
+正常事件：task_created、task_started、task_progress、task_succeeded。
+
+MemoBridge Worker 日志应出现：SourceItem loaded、content_hash verified、SemanticProfile upserted、task completed。
+
+最后通过 MemoBridge API 或数据库确认 SemanticProfile 已写入。
+
+七、测试重复创建
+
+使用完全相同的 workflow、content_hash、prompt_version 和 Idempotency-Key 再次创建任务。
+
+预期：不创建新任务，返回第一次创建的任务 ID，MemoBridge 不重复调用 LLM。
+
+八、测试 Worker 崩溃恢复
+
+1. 创建任务。
+2. 确认 Worker 已经 Claim。
+3. 在 LLM 执行期间按 Ctrl+C 关闭 Worker。
+4. 等待至少 30 秒，让 lease 到期。
+5. 重新启动 Worker。
+6. 查询原任务和事件。
+
+预期：Worker 退出 -> lease 到期 -> TaskPulse 恢复任务 -> 新 Worker 重新 Claim -> SemanticProfile 幂等写回 -> TaskPulse succeeded。
+
+九、常见问题
+
+任务一直 queued：检查 Worker 是否运行、TASKPULSE_URL 是否为 http://127.0.0.1:8085、workflow 是否正确。
+
+Worker 报 DATABASE_URL is required：在同一个 PowerShell 窗口重新设置 DATABASE_URL。
+
+任务变成 source_changed：content_hash 不正确，重新根据真实 SourceItem 计算。
+
+任务变成 provider_unavailable：检查 AI_PROVIDER 和对应 API Key。
+
+TaskPulse 返回 400：重新构建 TaskPulse 镜像，确认 workflow、lease_token 和 result_ref 协议已经进入容器。
+
+十、联调完成标准
+
+1. 一个真实 SourceItem 成功生成 SemanticProfile。
+2. 相同幂等键不会创建重复任务。
+3. LLM 失败后可以重试。
+4. Worker 崩溃后任务可以恢复并最终完成。
+
+完成这四项后，TaskPulse 与 MemoBridge 的第一版真实闭环完成，可以开始整理简历和准备面试。
