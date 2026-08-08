@@ -25,6 +25,10 @@ NN-short-experiment-name.md
 
 ## 当前实验
 
+`12-kubernetes-worker-crash-recovery.md`：Kubernetes Pod 自动恢复与 TaskPulse 租约恢复的协同实验。
+
+`13-kubernetes-worker-scaling.md`：Kubernetes Worker 副本扩展与任务吞吐量对比实验。
+
 - `01-memory-task-store.md`：内存任务存储的并发保护和复制边界。
 - `02-task-service.md`：应用层创建任务和事件的用例编排。
 - `03-llm-analysis-workflow.md`：第二类 workflow 的执行闭环。
