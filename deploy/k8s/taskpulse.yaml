@@ -1,0 +1,60 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: taskpulse
+  namespace: taskpulse
+spec:
+  selector:
+    app: taskpulse
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taskpulse
+  namespace: taskpulse
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: taskpulse
+  template:
+    metadata:
+      labels:
+        app: taskpulse
+    spec:
+      containers:
+        - name: taskpulse
+          image: taskpulse:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: taskpulse-config
+          env:
+            - name: MYSQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: MYSQL_USER
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: MYSQL_PASSWORD
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10

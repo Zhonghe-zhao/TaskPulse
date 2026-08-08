@@ -1,0 +1,10 @@
+.git
+.gitignore
+.env
+.taskpulse-gocache
+mysql_data
+bin
+tmp
+*.log
+docs
+*_test.go

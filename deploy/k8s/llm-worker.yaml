@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-worker
+  namespace: taskpulse
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: llm-worker
+  template:
+    metadata:
+      labels:
+        app: llm-worker
+    spec:
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: llm-worker
+          image: taskpulse-llm-worker:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: TASKPULSE_URL
+              value: http://taskpulse:8080
+            - name: TASKPULSE_EXTERNAL_LEASE
+              value: 30s
+            - name: TASKPULSE_EXTERNAL_POLL_INTERVAL
+              value: 200ms
+            - name: TASKPULSE_EXTERNAL_WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
